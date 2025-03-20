@@ -15,6 +15,7 @@ pydantic = "^2.4.2"
 uvicorn = "^0.34.0"
 protobuf = "^4.24.4"
 requests = "^2.31.0"
+scipy = "^1.15.2"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.2"
