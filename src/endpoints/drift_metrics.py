@@ -3,6 +3,7 @@ from pydantic import BaseModel, field_validator
 from typing import Dict, List, Optional, Any
 from src.service.data.model_data import ModelData
 from src.service.metrics.drift.meanshift import Meanshift
+from src.service.metrics.drift.kstest import KSTest
 import logging
 import math
 import uuid
@@ -180,8 +181,143 @@ async def compute_kstest(request: KSTestMetricRequest):
     """Compute the current value of KSTest metric."""
     try:
         logger.info(f"Computing KSTest for model: {request.modelId}")
-        # TODO: Implement
-        return {"status": "success", "value": 0.5}
+
+        # Enhanced validation
+        if not request.referenceTag:
+            return {
+                "status": "error",
+                "message": "Must provide a reference tag in request defining the original data distribution",
+            }
+
+        if request.batchSize is not None and request.batchSize <= 0:
+            return {
+                "status": "error",
+                "message": "Request batch size must be bigger than 0",
+            }
+
+        model_data = ModelData(request.modelId)
+        
+        # Get both reference and test data
+        inputs, outputs, metadata = await model_data.data()
+        
+        # Get column names
+        input_names, output_names, metadata_names = await model_data.column_names()
+        
+        # Filter by reference tag
+        if metadata is not None:
+            tag_column_indices = [
+                i for i, name in enumerate(metadata_names)
+                if name == "data_tag" or name.endswith(".data_tag")
+            ]
+
+            if tag_column_indices:
+                # Reference data (matching tag)
+                ref_mask = metadata[:, tag_column_indices[0]] == request.referenceTag
+                ref_inputs = inputs[ref_mask] if ref_mask.any() else inputs
+                
+                # Test data (not matching tag)
+                test_mask = metadata[:, tag_column_indices[0]] != request.referenceTag
+                test_inputs = inputs[test_mask] if test_mask.any() else inputs
+                
+                logger.info(
+                    f"Filtered data by tag '{request.referenceTag}': {np.sum(ref_mask)} reference rows, {np.sum(test_mask)} test rows"
+                )
+            else:
+                logger.warning(f"Reference tag '{request.referenceTag}' provided but no data_tag column found")
+                ref_inputs = inputs
+                test_inputs = inputs
+        else:
+            ref_inputs = inputs
+            test_inputs = inputs
+        
+        if ref_inputs is None or len(ref_inputs) == 0:
+            return {"status": "error", "message": "No reference data found"}
+        
+        if test_inputs is None or len(test_inputs) == 0:
+            return {"status": "error", "message": "No test data found for drift calculation"}
+        
+        if len(test_inputs) < 2:
+            logger.warning("Test data has less than two observations; KSTest results will not be numerically reliable")
+        
+        # Filter columns if specified
+        if request.fitColumns and len(request.fitColumns) > 0:
+            column_indices = [
+                i for i, name in enumerate(input_names) if name in request.fitColumns
+            ]
+            if not column_indices:
+                return {
+                    "status": "error",
+                    "message": "None of the specified columns found in the model data",
+                }
+
+            filtered_ref_inputs = ref_inputs[:, column_indices]
+            filtered_test_inputs = test_inputs[:, column_indices]
+            filtered_names = [input_names[i] for i in column_indices]
+        else:
+            filtered_ref_inputs = ref_inputs
+            filtered_test_inputs = test_inputs
+            filtered_names = input_names
+        
+        # Create KSTest instance
+        kstest = KSTest()
+        
+        # Calculate KS test
+        alpha = request.thresholdDelta or 0.05
+        results = kstest.calculate(filtered_ref_inputs, filtered_test_inputs, filtered_names, alpha)
+        
+        # Format results
+        namedValues = {}
+        for column_name, result in results.items():
+            namedValues[column_name] = result.p_value
+
+        formatted_results = {
+            "status": "success",
+            "namedValues": namedValues,
+            "results": {
+                column_name: result.to_dict() for column_name, result in results.items()
+            },
+        }
+        
+        # Calculate overall drift
+        if results:
+            drift_detected_count = sum(
+                1 for result in results.values() if result.reject_null
+            )
+            overall_drift_score = drift_detected_count / len(results) if results else 0
+            drift_detected = overall_drift_score > 0.5  # Majority of columns show drift
+
+            formatted_results["overall"] = {
+                "driftScore": overall_drift_score,
+                "driftDetected": drift_detected,
+                "driftedColumns": drift_detected_count,
+                "totalColumns": len(results),
+            }
+            
+            # Add detailed column results
+            col_details = []
+            max_col_len = max(len(col) for col in results.keys()) if results else 0
+            
+            for col_name, result in results.items():
+                reject = result.reject_null
+                detail = {
+                    "column": col_name,
+                    "pValue": result.p_value,
+                    "statistic": result.statistic, 
+                    "threshold": alpha,
+                    "driftDetected": reject,
+                    "interpretation": f"Column has p={result.p_value:.6f} probability of coming from the training distribution",
+                }
+                if reject:
+                    detail["interpretation"] += f" p <= {alpha} -> [SIGNIFICANT DRIFT]"
+                else:
+                    detail["interpretation"] += f" p > {alpha}"
+                
+                col_details.append(detail)
+                
+            formatted_results["columnDetails"] = col_details
+        
+        return formatted_results
+        
     except Exception as e:
         logger.error(f"Error computing KSTest: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error computing metric: {str(e)}")
@@ -192,7 +328,9 @@ async def get_kstest_definition():
     """Provide a general definition of KSTest metric."""
     return {
         "name": "Kolmogorov-Smirnov Test",
-        "description": "Description.",
+        "description": "KSTest calculates two sample Kolmogorov-Smirnov test per column which tests if two samples are drawn from the same distributions.",
+        "interpretation": "Low p-values (below the threshold) indicate significant drift in the distribution of values.",
+        "thresholdMeaning": "P-value threshold for significance testing. Lower values require stronger evidence of drift.",
     }
 
 
