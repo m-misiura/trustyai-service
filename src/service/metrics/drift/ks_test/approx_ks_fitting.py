@@ -1,5 +1,5 @@
 from typing import Dict, Optional
-from src.service.metrics.drift.gk_sketch import GKSketch
+from src.service.metrics.drift.ks_test.gk_sketch import GKSketch
 
 class ApproxKSFitting:
     """Store precomputed sketches for ApproxKSTest."""
