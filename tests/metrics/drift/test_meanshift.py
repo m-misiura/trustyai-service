@@ -5,7 +5,7 @@ import re
 from scipy import stats
 from typing import Dict, List, Union, Tuple
 
-from src.service.metrics.drift.meanshift import Meanshift, StatisticalSummaryValues, MeanshiftResult
+from src.service.metrics.drift.meanshift.meanshift import Meanshift, StatisticalSummaryValues, MeanshiftResult
 
 # Test constants - matching Java implementation
 EQUALITY_DELTA = 1e-6

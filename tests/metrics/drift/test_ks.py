@@ -2,7 +2,7 @@ import pytest
 import numpy as np
 from typing import List, Tuple
 
-from src.service.metrics.drift.kstest import KSTest, HypothesisTestResult
+from src.service.metrics.drift.ks_test.ks_test import KSTest, HypothesisTestResult
 
 # Constants matching Java implementation
 COL_SIZE = 4
