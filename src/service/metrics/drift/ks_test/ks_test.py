@@ -28,6 +28,7 @@ class KSTest:
             
         Returns:
             Dictionary mapping column names to drift results
+            Use get_stat_val(), get_p_value(), and is_reject() to access result values.
         """
         # Input validation
         if not isinstance(ref_data, np.ndarray) or not isinstance(test_data, np.ndarray):
