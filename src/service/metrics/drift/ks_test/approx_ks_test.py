@@ -6,7 +6,7 @@ import math
 
 from src.service.metrics.drift.ks_test.gk_sketch import GKSketch, GKException
 from src.service.metrics.drift.ks_test.approx_ks_fitting import ApproxKSFitting
-from src.service.metrics.drift.ks_test.ks_test import HypothesisTestResult
+from src.service.metrics.drift.hypothesis_test_result import HypothesisTestResult
 
 logger = logging.getLogger(__name__)
 
@@ -20,16 +20,24 @@ class ApproxKSTest:
     def __init__(self, eps: float = 0.01, train_data: Optional[np.ndarray] = None, 
                  column_names: Optional[List[str]] = None, approx_ks_fitting: Optional[ApproxKSFitting] = None):
         """Initialize ApproxKSTest."""
-        self.eps = eps
+        self._eps = eps  # Add underscore
         
         if approx_ks_fitting is not None:
-            self.train_gk_sketches = approx_ks_fitting.get_fit_sketches()
+            self._train_gk_sketches = approx_ks_fitting.get_fit_sketches()  # Add underscore
         elif train_data is not None and column_names is not None:
             # Precompute GKSketch of training data
             ks_fitting = self.precompute(train_data, column_names, eps)
-            self.train_gk_sketches = ks_fitting.get_fit_sketches()
+            self._train_gk_sketches = ks_fitting.get_fit_sketches()  # Add underscore
         else:
             raise ValueError("Either train_data and column_names or approx_ks_fitting must be provided")
+    
+    def get_eps(self) -> float:
+        """Get the epsilon value."""
+        return self._eps
+    
+    def get_train_gk_sketches(self) -> Dict[str, GKSketch]:
+        """Get the training GK sketches."""
+        return self._train_gk_sketches
     
     @staticmethod
     def precompute(train_data: np.ndarray, column_names: List[str], eps: float = 0.01) -> ApproxKSFitting:
@@ -97,11 +105,11 @@ class ApproxKSTest:
                 continue
                 
             # Check if column exists in training sketches
-            if col_name not in self.train_gk_sketches:
+            if col_name not in self._train_gk_sketches:  # Use underscore version
                 raise ValueError(f"Column {col_name} not found in precomputed sketches")
                 
             # Get train sketch
-            train_sketch = self.train_gk_sketches[col_name]
+            train_sketch = self._train_gk_sketches[col_name]  # Use underscore version
             
             # Skip if insufficient data
             if test_data.shape[0] < 2 or train_sketch.size() < 2:
@@ -111,7 +119,7 @@ class ApproxKSTest:
                 
             try:
                 # Build sketch for test data
-                test_sketch = GKSketch(self.eps)
+                test_sketch = GKSketch(self._eps)  # Use underscore version
                 for val in test_data[:, i]:
                     if np.isfinite(val):  # Skip NaN and infinity values
                         test_sketch.insert(val)
@@ -218,4 +226,4 @@ class ApproxKSTest:
     
     def __str__(self) -> str:
         """String representation."""
-        return f"ApproxKSTest [eps={self.eps}, trainGKSketches={self.train_gk_sketches}]"
+        return f"ApproxKSTest [eps={self._eps}, trainGKSketches={self._train_gk_sketches}]"  # Use underscore versions

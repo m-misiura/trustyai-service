@@ -2,25 +2,10 @@ import numpy as np
 from scipy import stats
 from typing import Dict, List, Optional, Union
 from dataclasses import dataclass
+from src.service.metrics.drift.hypothesis_test_result import HypothesisTestResult
 import logging
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class HypothesisTestResult:
-    """Results of a hypothesis test."""
-    
-    statistic: float
-    p_value: float
-    reject_null: bool
-    
-    def to_dict(self) -> Dict[str, Union[float, bool]]:
-        return {
-            "statistic": self.statistic,
-            "pValue": self.p_value,
-            "driftDetected": self.reject_null,
-        }
 
 
 class KSTest:
