@@ -167,26 +167,25 @@ class Meanshift:
         if reference_tag and metadata is not None:
             # Look for data_tag column in a more robust way
             tag_column_indices = [
-                i
-                for i, name in enumerate(metadata_names)
+                i for i, name in enumerate(metadata_names)
                 if name == "data_tag" or name.endswith(".data_tag")
             ]
 
             if tag_column_indices:
-                mask = metadata[:, tag_column_indices[0]] == reference_tag
+                # Check if we're dealing with byte strings
+                test_value = metadata[0, tag_column_indices[0]]
+                if isinstance(test_value, (bytes, np.bytes_)):
+                    # If metadata contains byte strings, encode the reference tag
+                    ref_tag_bytes = reference_tag.encode('utf-8')
+                    mask = np.array([tag == ref_tag_bytes for tag in metadata[:, tag_column_indices[0]]])
+                else:
+                    # Direct comparison if not bytes
+                    mask = metadata[:, tag_column_indices[0]] == reference_tag
+                    
                 inputs = inputs[mask] if mask.any() else inputs
-                logger.info(
-                    f"Filtered reference data by tag '{reference_tag}': {np.sum(mask)} rows selected"
-                )
+                logger.info(f"Filtered reference data by tag '{reference_tag}': {np.sum(mask)} rows selected")
             else:
-                logger.warning(
-                    f"Reference tag '{reference_tag}' provided but no data_tag column found"
-                )
-
-        if inputs is None or len(inputs) == 0:
-            raise ValueError(
-                f"No reference data found for model {model_data.model_name}"
-            )
+                logger.warning(f"Reference tag '{reference_tag}' provided but no data_tag column found")
 
         # Calculate statistics for each column
         fit_stats = {}
