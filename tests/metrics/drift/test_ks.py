@@ -2,7 +2,8 @@ import pytest
 import numpy as np
 from typing import List, Tuple
 
-from src.service.metrics.drift.ks_test.ks_test import KSTest, HypothesisTestResult
+from src.service.metrics.drift.hypothesis_test_result import HypothesisTestResult
+from src.service.metrics.drift.ks_test.ks_test import KSTest
 
 # Constants matching Java implementation
 COL_SIZE = 4
@@ -52,9 +53,9 @@ class TestKSTest:
         result = ks.calculate(data1, data2, names, ALPHA)
         
         assert len(result) == 1
-        assert result[names[0]].p_value >= 0.01
-        assert result[names[0]].statistic > 0.0
-        assert result[names[0]].reject_null == False
+        assert result[names[0]].get_p_value() >= 0.01
+        assert result[names[0]].get_stat_val() > 0.0
+        assert result[names[0]].is_reject() == False
     
     def test_univariate_normal_distributions_mean_shift(self):
         """Test KSTest on normal distributions with mean shift."""
@@ -66,9 +67,9 @@ class TestKSTest:
         result = ks.calculate(data1, data2, names, ALPHA)
         
         assert len(result) == 1
-        assert result[names[0]].p_value <= 0.01
-        assert result[names[0]].statistic > 0.0
-        assert result[names[0]].reject_null == True
+        assert result[names[0]].get_p_value() <= 0.01
+        assert result[names[0]].get_stat_val() > 0.0
+        assert result[names[0]].is_reject() == True
     
     def test_univariate_normal_distributions_variance_shift(self):
         """Test KSTest on normal distributions with variance shift."""
@@ -80,9 +81,9 @@ class TestKSTest:
         result = ks.calculate(data1, data2, names, ALPHA)
         
         assert len(result) == 1
-        assert result[names[0]].p_value <= 0.01
-        assert result[names[0]].statistic > 0.0
-        assert result[names[0]].reject_null == True
+        assert result[names[0]].get_p_value() <= 0.01
+        assert result[names[0]].get_stat_val() > 0.0
+        assert result[names[0]].is_reject() == True
     
     def test_multi_column_ks_test(self):
         """Test KSTest on multiple columns."""
@@ -100,16 +101,16 @@ class TestKSTest:
         result = ks.calculate(data1, data2, names, ALPHA)
         
         # Verify first column shows drift (N(0,1) vs N(1,1))
-        assert result[names[0]].p_value <= 0.05
-        assert result[names[0]].statistic > 0.0
-        assert result[names[0]].reject_null == True
+        assert result[names[0]].get_p_value() <= 0.05
+        assert result[names[0]].get_stat_val() > 0.0
+        assert result[names[0]].is_reject() == True
         
         # Second column should not show drift (N(1,1) vs N(1,1))
-        assert result[names[1]].p_value >= 0.05
-        assert result[names[1]].statistic > 0.0
-        assert result[names[1]].reject_null == False
+        assert result[names[1]].get_p_value() >= 0.05
+        assert result[names[1]].get_stat_val() > 0.0
+        assert result[names[1]].is_reject() == False
         
         # Third column should show drift (N(1,1) vs N(0,2))
-        assert result[names[2]].p_value <= 0.05
-        assert result[names[2]].statistic > 0.0
-        assert result[names[2]].reject_null == True
+        assert result[names[2]].get_p_value() <= 0.05
+        assert result[names[2]].get_stat_val() > 0.0
+        assert result[names[2]].is_reject() == True
