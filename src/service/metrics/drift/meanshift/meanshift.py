@@ -262,8 +262,8 @@ class Meanshift:
                     logger.warning(f"Test data {col_name} sample (first 3): {test_data[:3, i]}")
         
         # Print reference data stats
-        for col_name, stats in self.fit_stats.items():
-            logger.warning(f"Reference stats for {col_name}: mean={stats.mean}, var={stats.variance}, n={stats.n}")
+        for col_name, stat_values in self.fit_stats.items():
+            logger.warning(f"Reference stats for {col_name}: mean={stat_values.mean}, var={stat_values.variance}, n={stat_values.n}")
         # Input validation
         if not isinstance(test_data, np.ndarray):
             raise TypeError("test_data must be a numpy ndarray")
