@@ -195,35 +195,34 @@ class FourierMMD:
         return computed_stats
     
     def calculate(self, data: np.ndarray, threshold: float, gamma: float) -> HypothesisTestResult:
-        """
-        Calculate drift relative to the precomputed data.
-        
-        Args:
-            data: Test data
-            threshold: If probability of "data MMD score > (mean_mmd+std_mmd*gamma)" 
-                       is larger than threshold, we flag drift
-            gamma: Sets threshold to flag drift
-        
-        Returns:
-            HypothesisTestResult with drift information
-        """
+        """Calculate drift relative to the precomputed data."""
         # Get numeric columns
         numeric_data = data
         num_columns = numeric_data.shape[1]
         
         # Apply delta if needed
-        if self._fit_stats.is_delta_stat():
+        delta_stat = self._fit_stats.is_delta_stat()
+        if delta_stat is not None and delta_stat:
             x_in = self.delta(numeric_data, num_columns)
         else:
             x_in = numeric_data
         
-        # Set RNG to same seed for reproducibility
-        np.random.seed(self._fit_stats.get_random_seed())
-        rg = np.random.RandomState(self._fit_stats.get_random_seed()) 
-        
-        # Generate wave numbers and bias
-        wave_num = self.get_wave_num(num_columns, rg, self._fit_stats.get_n_mode())
-        bias = self.get_bias(rg, self._fit_stats.get_n_mode())
+        # Get random seed safely
+        random_seed = self._fit_stats.get_random_seed()
+        if random_seed is None:
+            random_seed = 42
+            
+        np.random.seed(random_seed)
+        rg = np.random.RandomState(random_seed)
+
+        # Get n_mode safely
+        n_mode = self._fit_stats.get_n_mode()
+        if n_mode is None:
+            raise ValueError("n_mode is not set in FourierMMDFitting")
+
+        # Generate wave numbers and bias - USE n_mode variable instead of getter
+        wave_num = self.get_wave_num(num_columns, rg, n_mode)
+        bias = self.get_bias(rg, n_mode)
         
         num_rows = x_in.shape[0]
         
@@ -232,22 +231,38 @@ class FourierMMD:
         for r in range(num_rows):
             x_in_rows.append(x_in[r])
         
-        # Scale the data
-        x1 = self.get_x_scaled(num_columns, num_rows, x_in, self._fit_stats.get_scale())
+        # Get scale safely
+        scale = self._fit_stats.get_scale()
+        if scale is None:
+            raise ValueError("scale is not set in FourierMMDFitting")
+
+        # Scale the data - USE scale variable
+        x1 = self.get_x_scaled(num_columns, num_rows, x_in, scale)
         
-        # Compute random Fourier coefficients
-        a_comp = self.random_fourier_coefficients(x1, wave_num, bias, num_rows, 
-                                                self._fit_stats.get_n_mode())
+        # Compute random Fourier coefficients - USE n_mode variable
+        a_comp = self.random_fourier_coefficients(x1, wave_num, bias, num_rows, n_mode)
         
-        # Calculate MMD
+        # Get a_ref safely
+        a_ref = self._fit_stats.get_a_ref()
+        if a_ref is None:
+            raise ValueError("a_ref is not set in FourierMMDFitting")
+        
+        # Calculate MMD - USE n_mode and a_ref variables
         mmd = 0.0
-        for c in range(self._fit_stats.get_n_mode()):
-            diff = self._fit_stats.get_a_ref()[c] - a_comp[c]
+        for c in range(n_mode):
+            diff = a_ref[c] - a_comp[c]
             term = diff * diff
             mmd += term
         
-        # Calculate drift score
-        drift_score = max((mmd - self._fit_stats.get_mean_mmd()) / self._fit_stats.get_std_mmd(), 0)
+        # Get mean_mmd and std_mmd safely
+        mean_mmd = self._fit_stats.get_mean_mmd()
+        std_mmd = self._fit_stats.get_std_mmd()
+        
+        if mean_mmd is None or std_mmd is None:
+            raise ValueError("mean_mmd or std_mmd is not set in FourierMMDFitting")
+
+        # Calculate drift score - USE local variables
+        drift_score = max((mmd - mean_mmd) / std_mmd, 0)
         
         # Calculate p-value using normal distribution
         cdf = self._normal_distribution.cdf(gamma - drift_score)
