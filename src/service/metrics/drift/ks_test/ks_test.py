@@ -1,6 +1,6 @@
 import numpy as np
-from scipy import stats
-from typing import Dict, List, Optional
+from scipy import stats  # type: ignore
+from typing import Dict, List, Optional, Any
 from src.service.metrics.drift.hypothesis_test_result import HypothesisTestResult
 import logging
 
@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 class KSTest:
     """Kolmogorov-Smirnov test for drift detection."""
     
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize KSTest."""
         pass
     
@@ -89,7 +89,7 @@ class KSTest:
         return result
     
     @classmethod
-    async def from_model_data(cls, model_data, reference_tag: Optional[str] = None) -> "KSTest":
+    async def from_model_data(cls, model_data: Any, reference_tag: Optional[str] = None) -> "KSTest":
         """
         Create KSTest instance from model data
         
