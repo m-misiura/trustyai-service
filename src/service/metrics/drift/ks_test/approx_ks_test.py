@@ -164,7 +164,7 @@ class ApproxKSTest:
         z = d * math.sqrt(nm)
         
         # Use the Kolmogorov distribution
-        return stats.kstwo.sf(z)
+        return stats.kstwo.sf(z, int(nm))
     
     def _compute_ks_distance(self, train_sketch: GKSketch, test_sketch: GKSketch) -> float:
         """
