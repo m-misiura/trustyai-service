@@ -1,5 +1,5 @@
 import math
-from typing import List
+from typing import List, Optional 
 from collections import namedtuple
 
 # Similar to Apache Commons Triple
@@ -21,17 +21,17 @@ class GKSketch:
     of quantile summaries. In SIGMOD, pages 58–66, 2001
     """
     
-    def __init__(self, epsilon: float, xmin: float = None, xmax: float = None, d: int = None):
+    def __init__(self, epsilon: float, xmin: Optional[float] = None, 
+                 xmax: Optional[float] = None, d: Optional[int] = None):
         """Initialize GKSketch with given parameters."""
         self._epsilon = epsilon
+        self._summary: List[Triple] = []
         
         if xmin is not None and xmax is not None and d is not None:
             self._xmin = xmin
             self._xmax = xmax
             self._numx = d
-            self._summary = []
         else:
-            self._summary = []
             self._numx = 0
             self._xmin = float('-inf')
             self._xmax = float('inf')
@@ -95,7 +95,7 @@ class GKSketch:
         for child in children:
             g_star += self._summary[child].middle
         
-        return g_star
+        return int(g_star)
     
     def get_children(self, i: int) -> List[int]:
         """Entries in the summary that are children of Ith element."""
@@ -184,13 +184,13 @@ class GKSketch:
         for j in range(index + 1):
             rmin += self._summary[j].middle
         
-        return rmin
+        return int(rmin)
     
     def get_max_rank(self, index: int, rmin: int) -> int:
         """Get maximum rank at index."""
         delta = self._summary[index].right
         rmax = delta + rmin
-        return rmax
+        return int(rmax)
     
     def quantile(self, phi: float) -> float:
         """Estimate a quantile for a given probability."""
