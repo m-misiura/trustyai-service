@@ -1,8 +1,8 @@
 import numpy as np
-from typing import List, Optional
+from typing import List, Optional, Any
 import logging
 import random
-from scipy.stats import norm
+from scipy.stats import norm  # type: ignore
 
 from src.service.metrics.drift.fourier_mmd.fourier_mmd_fitting import FourierMMDFitting
 from src.service.metrics.drift.hypothesis_test_result import HypothesisTestResult
@@ -60,11 +60,11 @@ class FourierMMD:
         else:
             raise ValueError("Either train_data and column_names or fourier_mmd_fitting must be provided")
     
-    def get_normal_distribution(self):
+    def get_normal_distribution(self) -> norm:
         """Get the normal distribution."""
         return self._normal_distribution
     
-    def get_fit_stats(self):
+    def get_fit_stats(self)  -> FourierMMDFitting:
         """Get the fit statistics."""
         return self._fit_stats
     
@@ -120,7 +120,7 @@ class FourierMMD:
         
         # Set the random seed for reproducibility
         np.random.seed(random_seed)
-        rg = np.random
+        rg = np.random.RandomState(random_seed)
         
         # Generate wave numbers and bias
         wave_num = FourierMMD.get_wave_num(num_columns, rg, n_mode)
@@ -189,8 +189,8 @@ class FourierMMD:
         mean_mmd = np.mean(sample_mmd2_no_nan)
         std_mmd = np.std(sample_mmd2_no_nan)
         
-        computed_stats.set_mean_mmd(mean_mmd)
-        computed_stats.set_std_mmd(std_mmd)
+        computed_stats.set_mean_mmd(float(mean_mmd))
+        computed_stats.set_std_mmd(float(std_mmd))
         
         return computed_stats
     
@@ -219,7 +219,7 @@ class FourierMMD:
         
         # Set RNG to same seed for reproducibility
         np.random.seed(self._fit_stats.get_random_seed())
-        rg = np.random
+        rg = np.random.RandomState(self._fit_stats.get_random_seed()) 
         
         # Generate wave numbers and bias
         wave_num = self.get_wave_num(num_columns, rg, self._fit_stats.get_n_mode())
@@ -380,7 +380,7 @@ class FourierMMD:
         return a_ref
     
     @classmethod
-    async def from_model_data(cls, model_data, reference_tag: Optional[str] = None,
+    async def from_model_data(cls, model_data: Any, reference_tag: Optional[str] = None,
                             delta_stat: bool = False, n_test: int = 100, n_window: int = 100,
                             sig: float = 1.0, random_seed: int = 42, n_mode: int = 100,
                             epsilon: float = 1e-6) -> "FourierMMD":
