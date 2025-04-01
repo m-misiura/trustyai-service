@@ -1,4 +1,4 @@
-from typing import Dict, Optional
+from typing import Dict
 from src.service.metrics.drift.ks_test.gk_sketch import GKSketch
 
 class ApproxKSFitting:

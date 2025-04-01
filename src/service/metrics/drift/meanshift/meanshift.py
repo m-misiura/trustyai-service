@@ -1,6 +1,6 @@
 import numpy as np
 from scipy import stats
-from typing import Dict, List, Optional, Union, Tuple
+from typing import Dict, List, Optional, Union
 from dataclasses import dataclass
 import logging
 

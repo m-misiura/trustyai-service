@@ -1,7 +1,6 @@
 import numpy as np
 from scipy import stats
-from typing import Dict, List, Optional, Union
-from dataclasses import dataclass
+from typing import Dict, List, Optional
 from src.service.metrics.drift.hypothesis_test_result import HypothesisTestResult
 import logging
 

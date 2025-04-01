@@ -1,5 +1,5 @@
 import math
-from typing import List, Any, Optional
+from typing import List
 from collections import namedtuple
 
 # Similar to Apache Commons Triple
