@@ -77,31 +77,43 @@ async def compute_approxkstest(request: ApproxKSTestMetricRequest):
             ]
 
             if tag_column_indices:
-                # Reference data (matching tag)
-                ref_mask = metadata[:, tag_column_indices[0]] == request.referenceTag
+                # Add debugging for metadata values
+                test_value = metadata[0, tag_column_indices[0]]
+                logger.warning(f"ApproxKSTest metadata value type: {type(test_value)}, value: {test_value}")
+                
+                # Check if reference tag is byte string
+                if isinstance(test_value, (bytes, np.bytes_)):
+                    logger.warning("Metadata contains byte strings - will encode reference tag")
+                    ref_tag_bytes = request.referenceTag.encode('utf-8')
+                    ref_mask = np.array([tag == ref_tag_bytes for tag in metadata[:, tag_column_indices[0]]])
+                    test_mask = np.array([tag != ref_tag_bytes for tag in metadata[:, tag_column_indices[0]]])
+                else:
+                    ref_mask = metadata[:, tag_column_indices[0]] == request.referenceTag
+                    test_mask = metadata[:, tag_column_indices[0]] != request.referenceTag
+                
+                # Apply the masks - FIX HERE: Use empty array for test data if none found
                 ref_inputs = inputs[ref_mask] if ref_mask.any() else inputs
+                test_inputs = inputs[test_mask] if test_mask.any() else np.array([])  # FIXED
                 
-                # Test data (not matching tag)
-                test_mask = metadata[:, tag_column_indices[0]] != request.referenceTag
-                test_inputs = inputs[test_mask] if test_mask.any() else inputs
-                
-                logger.info(
-                    f"Filtered data by tag '{request.referenceTag}': {np.sum(ref_mask)} reference rows, {np.sum(test_mask)} test rows"
-                )
+                # Add more debug logging
+                logger.warning(f"Reference data shape: {ref_inputs.shape}, Test data shape: {test_inputs.shape if len(test_inputs) > 0 else '(0, 0)'}")
             else:
                 logger.warning(f"Reference tag '{request.referenceTag}' provided but no data_tag column found")
                 ref_inputs = inputs
-                test_inputs = inputs
+                test_inputs = np.array([])  # FIXED
         else:
             ref_inputs = inputs
-            test_inputs = inputs
+            test_inputs = np.array([])  # FIXED
         
+        # Check for empty reference data
         if ref_inputs is None or len(ref_inputs) == 0:
             return {"status": "error", "message": "No reference data found"}
         
+        # Check for empty test data
         if test_inputs is None or len(test_inputs) == 0:
             return {"status": "error", "message": "No test data found for drift calculation"}
         
+        # Check for small test data
         if len(test_inputs) < 2:
             logger.warning("Test data has less than two observations; ApproxKSTest results will not be numerically reliable")
         
@@ -156,63 +168,10 @@ async def compute_approxkstest(request: ApproxKSTestMetricRequest):
         # Format results
         namedValues = {}
         for column_name, result in results.items():
-            namedValues[column_name] = result.get_p_value()
+            namedValues[column_name] = float(result.get_p_value())
 
-        formatted_results = {
-            "status": "success",
-            "namedValues": namedValues,
-            "results": {
-                column_name: {
-                    "statistic": result.get_stat_val(),
-                    "pValue": result.get_p_value(),
-                    "driftDetected": result.is_reject()
-                } for column_name, result in results.items()
-            },
-        }
-        
-        # Calculate overall drift
-        if results:
-            drift_detected_count = sum(
-                1 for result in results.values() if result.is_reject()
-            )
-            overall_drift_score = drift_detected_count / len(results) if results else 0
-            drift_detected = overall_drift_score > 0.5  # Majority of columns show drift
-
-            formatted_results["overall"] = {
-                "driftScore": overall_drift_score,
-                "driftDetected": drift_detected,
-                "driftedColumns": drift_detected_count,
-                "totalColumns": len(results),
-            }
-            
-            # Add detailed column results
-            col_details = []
-            max_col_len = max(len(col) for col in results.keys()) if results else 0
-            
-            for col_name, result in results.items():
-                reject = result.is_reject()
-                detail = {
-                    "column": col_name,
-                    "pValue": result.get_p_value(),
-                    "statistic": result.get_stat_val(),
-                    "threshold": alpha,
-                    "driftDetected": reject,
-                    "interpretation": f"Column has p={result.get_p_value():.6f} probability of coming from the training distribution",
-                }
-                if reject:
-                    detail["interpretation"] += f" p <= {alpha} -> [SIGNIFICANT DRIFT]"
-                else:
-                    detail["interpretation"] += f" p > {alpha}"
-                
-                col_details.append(detail)
-                
-            formatted_results["columnDetails"] = col_details
-        
-        # Add sketch fitting for reuse
-        if request.sketchFitting:
-            formatted_results["sketchFitting"] = request.sketchFitting
-        
-        return formatted_results
+        # Return only the namedValues like Java implementation
+        return namedValues
         
     except Exception as e:
         logger.error(f"Error computing ApproxKSTest: {str(e)}")
@@ -464,32 +423,7 @@ async def compute_fouriermmd(request: FourierMMDMetricRequest):
         result = fourier_mmd_instance.calculate(filtered_test_inputs, threshold, gamma)
         
         # Format results
-        formatted_results = {
-            "status": "success",
-            "value": float(result.get_p_value()),
-            "driftDetected": bool(result.is_reject()),
-            "driftScore": float(result.get_stat_val()),
-            "interpretation": f"Test data has p={float(result.get_p_value()):.6f} probability of having drifted from the training distribution."
-        }
-        # Add detailed column results        
-        if result.is_reject():
-            formatted_results["interpretation"] += f" p > {threshold} -> [SIGNIFICANT DRIFT]"
-        else:
-            formatted_results["interpretation"] += f" p <= {threshold}"
-        
-        # Add fitting parameters for reuse
-        if request.fitting:
-             formatted_results["fitting"] = {
-                "randomSeed": int(request.fitting.randomSeed) if request.fitting.randomSeed is not None else None,
-                "deltaStat": bool(request.fitting.deltaStat) if request.fitting.deltaStat is not None else None,
-                "nMode": int(request.fitting.nMode) if request.fitting.nMode is not None else None,
-                "scale": [float(x) for x in request.fitting.scale] if request.fitting.scale is not None else None,
-                "aRef": [float(x) for x in request.fitting.aRef] if request.fitting.aRef is not None else None,
-                "meanMMD": float(request.fitting.meanMMD) if request.fitting.meanMMD is not None else None,
-                "stdMMD": float(request.fitting.stdMMD) if request.fitting.stdMMD is not None else None
-            }
-        
-        return formatted_results
+        return float(result.get_p_value())
             
     except Exception as e:
         logger.error(f"Error computing FourierMMD: {str(e)}")
@@ -572,12 +506,14 @@ async def compute_kstest(request: KSTestMetricRequest):
                 if isinstance(tag_col[0], (bytes, np.bytes_)):
                     ref_tag = request.referenceTag.encode('utf-8')
                     ref_mask = np.array([t == ref_tag for t in tag_col])
+                    test_mask = np.array([t != ref_tag for t in tag_col])
                 else:
                     ref_mask = tag_col == request.referenceTag
+                    test_mask = tag_col != request.referenceTag
                 
                 # Filter reference and test data
-                ref_data = inputs[ref_mask]
-                test_data = inputs[~ref_mask]
+                ref_data = inputs[ref_mask] if ref_mask.any() else inputs
+                test_data = inputs[test_mask] if test_mask.any() else np.array([])
                 
                 logger.info(f"Filtered data: {ref_data.shape[0]} reference rows, {test_data.shape[0]} test rows")
             else:
@@ -599,30 +535,13 @@ async def compute_kstest(request: KSTestMetricRequest):
             alpha=alpha
         )
         
-        # Convert results to API response format - PROPERLY CONVERT NUMPY TYPES
-        formatted_results = {
-            "status": "success",
-            "results": {}
-        }
-        
+        # Format results to match Java implementation exactly
+        namedValues = {}
         for column_name, result in ks_results.items():
-            # Use the correct getter methods
-            formatted_results["results"][column_name] = {
-                "statistic": float(result.get_stat_val()),  # Correct method call
-                "pValue": float(result.get_p_value()),      # Correct method call
-                "driftDetected": bool(result.is_reject())   # Correct method call
-            }
+            namedValues[column_name] = float(result.get_p_value())
         
-        # Add overall summary
-        drift_detected_count = sum(1 for r in ks_results.values() if r.is_reject())
-        formatted_results["overall"] = {
-            "driftScore": float(drift_detected_count) / len(ks_results) if ks_results else 0.0,
-            "driftDetected": bool(drift_detected_count > 0),
-            "driftedColumns": int(drift_detected_count),
-            "totalColumns": len(ks_results)
-        }
-        
-        return formatted_results
+        # Return only the namedValues map like Java implementation
+        return namedValues
         
     except Exception as e:
         logger.error(f"Error computing KSTest: {str(e)}")
@@ -775,10 +694,7 @@ async def compute_meanshift(request: MeanshiftMetricRequest):
         for column_name, result in mean_shift_results.items():
             namedValues[column_name] = float(result.p_value)
             
-        return {
-            "status": "success",
-            "namedValues": namedValues
-        }
+        return namedValues
         
     except Exception as e:
         logger.error(f"Error computing Meanshift: {str(e)}")
