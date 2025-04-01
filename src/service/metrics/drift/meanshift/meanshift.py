@@ -1,6 +1,6 @@
 import numpy as np
-from scipy import stats
-from typing import Dict, List, Optional, Union
+from scipy import stats  # type: ignore
+from typing import Dict, List, Optional, Union, Any
 from dataclasses import dataclass
 import logging
 
@@ -159,17 +159,17 @@ class Meanshift:
         if denominator == 0:
             return 0.0
             
-        return numerator / denominator
+        return float(numerator / denominator)
 
     @staticmethod
     def _calculate_p_value(t_stat: float, df: int) -> float:
         """Calculate p-value for t-statistic using two-tailed test."""
         # Two-tailed test like Java implementation
-        return stats.t.sf(abs(t_stat), df) * 2
+        return float(stats.t.sf(abs(t_stat), df) * 2)
 
     @classmethod
     async def from_model_data(
-        cls, model_data, reference_tag: Optional[str] = None
+        cls, model_data: Any, reference_tag: Optional[str] = None
     ) -> "Meanshift":
         """
         Create Meanshift instance from model data
