@@ -120,7 +120,31 @@ class Meanshift:
             fit_stats: Dictionary mapping column names to their statistical summaries
         """
         self.fit_stats = fit_stats or {}
-
+    @classmethod
+    def precompute(cls, data: np.ndarray, column_names: List[str]) -> "Meanshift":
+        """
+        Precompute statistics for reference data (matches Java PerColumnStatisticalAnalysis.precompute)
+        
+        Args:
+            data: Reference data as numpy array
+            column_names: Names of columns in the data
+            
+        Returns:
+            Meanshift instance with fitted statistics
+        """
+        # Calculate statistics for each column (mirrors Java implementation)
+        fit_stats = {}
+        for i, col_name in enumerate(column_names):
+            if i < data.shape[1]:  # Make sure column exists in data
+                col_data = data[:, i]
+                # Only process numerical columns (same as Java's Type.NUMBER check)
+                if np.issubdtype(col_data.dtype, np.number):
+                    fit_stats[col_name] = StatisticalSummaryValues.from_array(col_data)
+                    logger.debug(f"Computed reference statistics for column {col_name}")
+        
+        # Return Meanshift instance initialized with the computed statistics
+        return cls(fit_stats)
+    
     @staticmethod
     def _calculate_t_stat(ref_stats: StatisticalSummaryValues, test_stats: StatisticalSummaryValues) -> float:
         """
@@ -229,6 +253,17 @@ class Meanshift:
         Returns:
             Dictionary mapping column names to drift results
         """
+        if len(test_data) == 0:
+            logger.warning("Test data array is empty")
+        else:
+            logger.warning(f"Test data shape: {test_data.shape}")
+            for i, col_name in enumerate(column_names[:min(3, len(column_names))]):
+                if i < test_data.shape[1]:
+                    logger.warning(f"Test data {col_name} sample (first 3): {test_data[:3, i]}")
+        
+        # Print reference data stats
+        for col_name, stats in self.fit_stats.items():
+            logger.warning(f"Reference stats for {col_name}: mean={stats.mean}, var={stats.variance}, n={stats.n}")
         # Input validation
         if not isinstance(test_data, np.ndarray):
             raise TypeError("test_data must be a numpy ndarray")

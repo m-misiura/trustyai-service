@@ -712,48 +712,73 @@ async def compute_meanshift(request: MeanshiftMetricRequest):
         # Create ModelData instance
         model_data = ModelData(request.modelId)
         
-        # Use Meanshift's from_model_data class method
-        # This handles loading reference data filtered by tag
-        meanshift = await Meanshift.from_model_data(
-            model_data=model_data, 
-            reference_tag=request.referenceTag
-        )
+        # Load all data
+        inputs, _, metadata = await model_data.data()
+        input_names, _, metadata_names = await model_data.column_names()
         
-        # Load all data to test against
-        inputs, _, _ = await model_data.data()
-        input_names, _, _ = await model_data.column_names()
+        # CORRECT ORDER: First define tag_column_indices, then use it
+        # Filter by reference tag
+        if metadata is not None:
+            tag_column_indices = [
+                i for i, name in enumerate(metadata_names)
+                if name == "data_tag" or name.endswith(".data_tag")
+            ]
+
+            # NOW we can use tag_column_indices
+            if tag_column_indices:
+                # Add debugging for metadata
+                test_value = metadata[0, tag_column_indices[0]]
+                logger.warning(f"Metadata value type: {type(test_value)}, value: {test_value}")
+                
+                # Check if reference tag is byte string
+                if isinstance(test_value, (bytes, np.bytes_)):
+                    logger.warning("Metadata contains byte strings - will encode reference tag")
+                    ref_tag_bytes = request.referenceTag.encode('utf-8')
+                    ref_mask = np.array([tag == ref_tag_bytes for tag in metadata[:, tag_column_indices[0]]])
+                    test_mask = np.array([tag != ref_tag_bytes for tag in metadata[:, tag_column_indices[0]]])
+                else:
+                    ref_mask = metadata[:, tag_column_indices[0]] == request.referenceTag
+                    test_mask = metadata[:, tag_column_indices[0]] != request.referenceTag
+                
+                # Apply the masks
+                ref_inputs = inputs[ref_mask] if ref_mask.any() else inputs
+                test_inputs = inputs[test_mask] if test_mask.any() else np.array([])
+                
+                logger.info(
+                    f"Filtered data by tag '{request.referenceTag}': {np.sum(ref_mask)} reference rows, {np.sum(test_mask)} test rows"
+                )
+            else:
+                logger.warning(f"Reference tag '{request.referenceTag}' provided but no data_tag column found")
+                ref_inputs = inputs
+                test_inputs = np.array([])
+        else:
+            ref_inputs = inputs
+            test_inputs = np.array([])
+            
+        # Add small dataset warning like Java implementation
+        if len(test_inputs) < 2:
+            logger.warning("Test data has less than two observations; Meanshift results will not be numerically reliable.")
         
-        # Calculate drift on all the data
+        # Use the new precompute method to mirror Java implementation
+        meanshift = Meanshift.precompute(ref_inputs, input_names)
+        
+        # Calculate drift using ONLY TEST DATA (exactly as in Java)
         alpha = request.thresholdDelta or 0.05
         mean_shift_results = meanshift.calculate(
-            test_data=inputs, 
+            test_data=test_inputs,
             column_names=input_names, 
             alpha=alpha
         )
         
-        # Convert results to API response format
-        formatted_results = {
-            "status": "success",
-            "results": {}
-        }
-        
+        # Format results to match Java implementation EXACTLY
+        namedValues = {}
         for column_name, result in mean_shift_results.items():
-            formatted_results["results"][column_name] = {
-                "tStat": float(result.t_stat),
-                "pValue": float(result.p_value),
-                "driftDetected": bool(result.reject_null)
-            }
-        
-        # Add overall summary
-        drift_detected_count = sum(1 for r in mean_shift_results.values() if r.reject_null)
-        formatted_results["overall"] = {
-            "driftScore": float(drift_detected_count) / len(mean_shift_results) if mean_shift_results else 0,
-            "driftDetected": bool(drift_detected_count > 0),
-            "driftedColumns": drift_detected_count,
-            "totalColumns": len(mean_shift_results)
+            namedValues[column_name] = float(result.p_value)
+            
+        return {
+            "status": "success",
+            "namedValues": namedValues
         }
-        
-        return formatted_results
         
     except Exception as e:
         logger.error(f"Error computing Meanshift: {str(e)}")
