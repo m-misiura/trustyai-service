@@ -1,6 +1,6 @@
 import numpy as np
-from scipy import stats
-from typing import Dict, List, Optional
+from scipy import stats  # type: ignore
+from typing import Dict, List, Optional, Any
 import logging
 import math
 
@@ -164,7 +164,7 @@ class ApproxKSTest:
         z = d * math.sqrt(nm)
         
         # Use the Kolmogorov distribution
-        return stats.kstwo.sf(z, int(nm))
+        return float(stats.kstwo.sf(z, int(nm)))
     
     def _compute_ks_distance(self, train_sketch: GKSketch, test_sketch: GKSketch) -> float:
         """
@@ -202,7 +202,7 @@ class ApproxKSTest:
         return max_d
     
     @classmethod
-    async def from_model_data(cls, model_data, reference_tag: Optional[str] = None, 
+    async def from_model_data(cls, model_data: Any, reference_tag: Optional[str] = None, 
                              epsilon: float = 0.01) -> "ApproxKSTest":
         """Create ApproxKSTest instance from model data."""
         # Get reference data
