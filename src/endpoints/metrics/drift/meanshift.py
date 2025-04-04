@@ -2,11 +2,12 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from typing import Dict, List, Optional, Any
 from src.service.metrics.drift.meanshift import Meanshift
-from src.service.constants import INPUT_SUFFIX, METADATA_SUFFIX, OUTPUT_SUFFIX
+from src.service.constants import INPUT_SUFFIX, METADATA_SUFFIX
 from src.service.data.storage import get_storage_interface
 import logging
 import numpy as np
 import uuid
+import pickle
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -15,8 +16,6 @@ storage_interface = get_storage_interface()
 class ScheduleId(BaseModel):
     requestId: str
 
-
-# Meanshift
 class StatisticalSummaryValues(BaseModel):
     mean: float
     variance: float
@@ -25,7 +24,6 @@ class StatisticalSummaryValues(BaseModel):
     min: float
     sum: float
     standardDeviation: float
-
 
 class MeanshiftMetricRequest(BaseModel):
     modelId: str
@@ -37,102 +35,85 @@ class MeanshiftMetricRequest(BaseModel):
     fitColumns: List[str] = []
     fitting: Optional[Dict[str, StatisticalSummaryValues]] = None
 
-
 @router.post("/metrics/drift/meanshift")
 async def compute_meanshift(request: MeanshiftMetricRequest):
     try:
         model_id = request.modelId
-        logger.info(f"Computing Meanshift for model: {model_id}")
+        reference_tag = request.referenceTag
+        logger.info(f"Computing Meanshift for model: {model_id}, reference tag: {reference_tag}")
         
-        # Direct access to input data - skip ModelData intermediary
+        # Access datasets
         input_dataset = model_id + INPUT_SUFFIX
         metadata_dataset = model_id + METADATA_SUFFIX
         
-        # Read input data
+        # Check datasets exist
         if not await storage_interface.dataset_exists(input_dataset):
             return {"error": f"Input dataset {input_dataset} does not exist"}
         
+        if not await storage_interface.dataset_exists(metadata_dataset):
+            return {"error": f"Metadata dataset {metadata_dataset} does not exist"}
+        
+        # Read input data
         input_data, input_names = await storage_interface.read_data(input_dataset)
         logger.info(f"Read input data: shape={input_data.shape}, columns={input_names}")
         
-        # Convert NumPy array of column names to a list if needed
+        # Ensure input_names is a list
         if isinstance(input_names, np.ndarray):
             input_names = input_names.tolist()
         
         # Read metadata
-        if not await storage_interface.dataset_exists(metadata_dataset):
-            return {"error": f"Metadata dataset {metadata_dataset} does not exist"}
-        
-        
         metadata_data, metadata_names = await storage_interface.read_data(metadata_dataset)
-        logger.info(f"Read metadata: shape={metadata_data.shape}, columns={metadata_names}")
+        logger.info(f"Read metadata: length={len(metadata_data)}, columns={metadata_names}")
         
         # Extract reference and test data indices
         ref_indices = []
         test_indices = []
+        available_tags = set()
         
-        # Process metadata
-        logger.info("Processing metadata")
+        # Process metadata - check first row to see format
+        if len(metadata_data) == 0:
+            return {"error": "No metadata found"}
+            
+        sample_row = metadata_data[0]
+        logger.info(f"Sample metadata type: {type(sample_row)}")
         
-        # Print sample metadata row for debugging
-        if len(metadata_data) > 0:
-            sample_row = metadata_data[0]
-            logger.info(f"Sample metadata row type: {type(sample_row)}, value: {sample_row}")
-        
-        
-        # Process each metadata record
+        # Process all metadata rows
         for i in range(len(metadata_data)):
             try:
                 row = metadata_data[i]
-                
-                # Case 1: Direct dictionary format
+                metadata_dict = None
                 if isinstance(row, dict) and 'data_tag' in row:
-                    if i < 3:
-                        logger.info(f"Metadata {i} (direct dict): {row}")
-                    
-                    # Add to proper index list based on tag
-                    if row['data_tag'] == request.referenceTag:
-                        ref_indices.append(i)
-                    else:
-                        test_indices.append(i)
-                
-                # Case 2: Tuple of bytes format
-                elif isinstance(row, tuple) and len(row) > 0 and isinstance(row[0], bytes):
-                    pickled_data = row[0]
-                    metadata_dict = pickle.loads(pickled_data)
-                    
-                    if i < 3:
-                        logger.info(f"Metadata {i} (pickled): {metadata_dict}")
-                    
-                    if metadata_dict.get('data_tag') == request.referenceTag:
-                        ref_indices.append(i)
-                    else:
-                        test_indices.append(i)
-                
-                # Case 3: Structured array with 'metadata' field
-                elif hasattr(row, 'dtype') and 'metadata' in row.dtype.names:
-                    pickled_data = row['metadata']
-                    metadata_dict = pickle.loads(pickled_data)
-                    
-                    if i < 3:
-                        logger.info(f"Metadata {i} (structured): {metadata_dict}")
-                    
-                    if metadata_dict.get('data_tag') == request.referenceTag:
-                        ref_indices.append(i)
-                    else:
-                        test_indices.append(i)
+                    # Handle direct dictionary format
+                    metadata_dict = row
                 else:
-                    if i < 3:
-                        logger.warning(f"Unknown metadata format at index {i}: {type(row)}")
+                    # raise an error if the expected format is not found
+                    raise ValueError(f"Unexpected metadata format at row {i}")
+                
+                if metadata_dict and 'data_tag' in metadata_dict:
+                    tag = metadata_dict['data_tag']
+                    available_tags.add(tag)
                     
+                    if i < 3:
+                        logger.info(f"Row {i} has tag: {tag}")
+                    
+                    if tag == reference_tag:
+                        ref_indices.append(i)
+                    else:
+                        test_indices.append(i)
+                        
             except Exception as e:
                 logger.warning(f"Error processing metadata row {i}: {str(e)}")
         
-        logger.info(f"Found {len(ref_indices)} reference indices and {len(test_indices)} test indices")
+        logger.info(f"Available tags: {available_tags}")
+        logger.info(f"Found {len(ref_indices)} reference rows and {len(test_indices)} test rows")
         
         # Check if we have enough data
         if not ref_indices:
-            return {"error": "No reference data found"}
+            if reference_tag:
+                return {"error": f"No reference data found with tag '{reference_tag}'. Available tags: {list(available_tags)}"}
+            else:
+                return {"error": "No reference tag specified and no default reference data found"}
+                
         if not test_indices:
             return {"error": "No test data found"}
         
@@ -146,18 +127,13 @@ async def compute_meanshift(request: MeanshiftMetricRequest):
         meanshift = Meanshift.precompute(ref_data, input_names)
         
         alpha = request.thresholdDelta or 0.05
-        logger.info(f"Calling calculate with input_names type: {type(input_names)}")
-        if isinstance(input_names, (list, tuple)):
-            logger.info(f"Column names: {input_names}")
-        else:
-            logger.info(f"Column names: {input_names.tolist() if hasattr(input_names, 'tolist') else str(input_names)}")
+        logger.info(f"Using alpha threshold: {alpha}")
         
         mean_shift_results = meanshift.calculate(
             test_data=test_data, 
-            column_names=input_names,  # Using the converted list of column names
+            column_names=input_names,
             alpha=alpha
         )
-        
         
         # Format results
         namedValues = {}
@@ -168,8 +144,6 @@ async def compute_meanshift(request: MeanshiftMetricRequest):
             
     except Exception as e:
         logger.error(f"Error computing Meanshift: {str(e)}", exc_info=True)
-        import traceback
-        logger.error(f"Stack trace: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Error computing metric: {str(e)}")
 
 
