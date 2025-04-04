@@ -8,14 +8,19 @@ from src.service.metrics.drift.ks_test.approx_ks_test import ApproxKSTest
 from src.service.metrics.drift.ks_test.approx_ks_fitting import ApproxKSFitting
 from src.service.metrics.drift.fourier_mmd.fourier_mmd import FourierMMD
 from src.service.metrics.drift.fourier_mmd.fourier_mmd_fitting import FourierMMDFitting
+from src.service.data.storage import get_storage_interface
+from src.service.constants import INPUT_SUFFIX, OUTPUT_SUFFIX, METADATA_SUFFIX
+
 
 import logging
 import math
+import json
 import uuid
 import numpy as np
+import pickle
 router = APIRouter()
 logger = logging.getLogger(__name__)
-
+storage_interface = get_storage_interface()
 
 class ScheduleId(BaseModel):
     requestId: str
@@ -41,6 +46,25 @@ class ApproxKSTestMetricRequest(BaseModel):
     epsilon: Optional[float] = None
     sketchFitting: Optional[Dict[str, GKSketch]] = None
 
+def extract_tag_from_metadata(metadata_value):
+    """Extract tag from metadata in various formats."""
+    if metadata_value is None:
+        return None
+    
+    if isinstance(metadata_value, bytes):
+        try:
+            # Try to decode as JSON first
+            decoded = metadata_value.decode('utf-8')
+            data = json.loads(decoded)
+            if isinstance(data, dict) and 'tag' in data:
+                return data['tag']
+        except json.JSONDecodeError:
+            # If not JSON, try as plain string
+            try:
+                return decoded
+            except:
+                pass
+    return metadata_value
 
 @router.post("/metrics/drift/approxkstest")
 async def compute_approxkstest(request: ApproxKSTestMetricRequest):
@@ -617,166 +641,134 @@ class MeanshiftMetricRequest(BaseModel):
 
 @router.post("/metrics/drift/meanshift")
 async def compute_meanshift(request: MeanshiftMetricRequest):
-    """Compute the current value of Meanshift metric."""
     try:
-        logger.info(f"Computing Meanshift for model: {request.modelId}")
+        model_id = request.modelId
+        logger.info(f"Computing Meanshift for model: {model_id}")
         
-        # Input validation
-        if not request.referenceTag:
-            return {
-                "status": "error",
-                "message": "Must provide a reference tag in request defining the original data distribution",
-            }
+        # Direct access to input data - skip ModelData intermediary
+        input_dataset = model_id + INPUT_SUFFIX
+        metadata_dataset = model_id + METADATA_SUFFIX
         
-        # Create ModelData instance
-        model_data = ModelData(request.modelId)
+        # Read input data
+        if not await storage_interface.dataset_exists(input_dataset):
+            return {"error": f"Input dataset {input_dataset} does not exist"}
         
-        # Load all data
-        inputs, _, metadata = await model_data.data()
-        input_names, _, metadata_names = await model_data.column_names()
+        input_data, input_names = await storage_interface.read_data(input_dataset)
+        logger.info(f"Read input data: shape={input_data.shape}, columns={input_names}")
         
-        # CORRECT ORDER: First define tag_column_indices, then use it
-        # Filter by reference tag
-        if metadata is not None:
-            tag_column_indices = [
-                i for i, name in enumerate(metadata_names)
-                if name == "data_tag" or name.endswith(".data_tag")
-            ]
-
-            # NOW we can use tag_column_indices
-            if tag_column_indices:
-                # Add debugging for metadata
-                test_value = metadata[0, tag_column_indices[0]]
-                logger.warning(f"Metadata value type: {type(test_value)}, value: {test_value}")
+        # Convert NumPy array of column names to a list if needed
+        if isinstance(input_names, np.ndarray):
+            input_names = input_names.tolist()
+        
+        # Read metadata
+        if not await storage_interface.dataset_exists(metadata_dataset):
+            return {"error": f"Metadata dataset {metadata_dataset} does not exist"}
+        
+        
+        metadata_data, metadata_names = await storage_interface.read_data(metadata_dataset)
+        logger.info(f"Read metadata: shape={metadata_data.shape}, columns={metadata_names}")
+        
+        # Extract reference and test data indices
+        ref_indices = []
+        test_indices = []
+        
+        # Process metadata
+        logger.info("Processing metadata")
+        
+        # Print sample metadata row for debugging
+        if len(metadata_data) > 0:
+            sample_row = metadata_data[0]
+            logger.info(f"Sample metadata row type: {type(sample_row)}, value: {sample_row}")
+        
+        
+        # Process each metadata record
+        for i in range(len(metadata_data)):
+            try:
+                row = metadata_data[i]
                 
-                # Check if reference tag is byte string
-                if isinstance(test_value, (bytes, np.bytes_)):
-                    logger.warning("Metadata contains byte strings - will encode reference tag")
-                    ref_tag_bytes = request.referenceTag.encode('utf-8')
-                    ref_mask = np.array([tag == ref_tag_bytes for tag in metadata[:, tag_column_indices[0]]])
-                    test_mask = np.array([tag != ref_tag_bytes for tag in metadata[:, tag_column_indices[0]]])
+                # Case 1: Direct dictionary format
+                if isinstance(row, dict) and 'data_tag' in row:
+                    if i < 3:
+                        logger.info(f"Metadata {i} (direct dict): {row}")
+                    
+                    # Add to proper index list based on tag
+                    if row['data_tag'] == request.referenceTag:
+                        ref_indices.append(i)
+                    else:
+                        test_indices.append(i)
+                
+                # Case 2: Tuple of bytes format
+                elif isinstance(row, tuple) and len(row) > 0 and isinstance(row[0], bytes):
+                    pickled_data = row[0]
+                    metadata_dict = pickle.loads(pickled_data)
+                    
+                    if i < 3:
+                        logger.info(f"Metadata {i} (pickled): {metadata_dict}")
+                    
+                    if metadata_dict.get('data_tag') == request.referenceTag:
+                        ref_indices.append(i)
+                    else:
+                        test_indices.append(i)
+                
+                # Case 3: Structured array with 'metadata' field
+                elif hasattr(row, 'dtype') and 'metadata' in row.dtype.names:
+                    pickled_data = row['metadata']
+                    metadata_dict = pickle.loads(pickled_data)
+                    
+                    if i < 3:
+                        logger.info(f"Metadata {i} (structured): {metadata_dict}")
+                    
+                    if metadata_dict.get('data_tag') == request.referenceTag:
+                        ref_indices.append(i)
+                    else:
+                        test_indices.append(i)
                 else:
-                    ref_mask = metadata[:, tag_column_indices[0]] == request.referenceTag
-                    test_mask = metadata[:, tag_column_indices[0]] != request.referenceTag
-                
-                # Apply the masks
-                ref_inputs = inputs[ref_mask] if ref_mask.any() else inputs
-                test_inputs = inputs[test_mask] if test_mask.any() else np.array([])
-                
-                logger.info(
-                    f"Filtered data by tag '{request.referenceTag}': {np.sum(ref_mask)} reference rows, {np.sum(test_mask)} test rows"
-                )
-            else:
-                logger.warning(f"Reference tag '{request.referenceTag}' provided but no data_tag column found")
-                ref_inputs = inputs
-                test_inputs = np.array([])
-        else:
-            ref_inputs = inputs
-            test_inputs = np.array([])
-            
-        # Add small dataset warning like Java implementation
-        if len(test_inputs) < 2:
-            logger.warning("Test data has less than two observations; Meanshift results will not be numerically reliable.")
+                    if i < 3:
+                        logger.warning(f"Unknown metadata format at index {i}: {type(row)}")
+                    
+            except Exception as e:
+                logger.warning(f"Error processing metadata row {i}: {str(e)}")
         
-        # Use the new precompute method to mirror Java implementation
-        meanshift = Meanshift.precompute(ref_inputs, input_names)
+        logger.info(f"Found {len(ref_indices)} reference indices and {len(test_indices)} test indices")
         
-        # Calculate drift using ONLY TEST DATA (exactly as in Java)
+        # Check if we have enough data
+        if not ref_indices:
+            return {"error": "No reference data found"}
+        if not test_indices:
+            return {"error": "No test data found"}
+        
+        # Extract reference and test data
+        ref_data = input_data[ref_indices]
+        test_data = input_data[test_indices]
+        
+        logger.info(f"Reference data shape: {ref_data.shape}, Test data shape: {test_data.shape}")
+        
+        # Calculate meanshift
+        meanshift = Meanshift.precompute(ref_data, input_names)
+        
         alpha = request.thresholdDelta or 0.05
+        logger.info(f"Calling calculate with input_names type: {type(input_names)}")
+        if isinstance(input_names, (list, tuple)):
+            logger.info(f"Column names: {input_names}")
+        else:
+            logger.info(f"Column names: {input_names.tolist() if hasattr(input_names, 'tolist') else str(input_names)}")
+        
         mean_shift_results = meanshift.calculate(
-            test_data=test_inputs,
-            column_names=input_names, 
+            test_data=test_data, 
+            column_names=input_names,  # Using the converted list of column names
             alpha=alpha
         )
         
-        # Format results to match Java implementation EXACTLY
+        
+        # Format results
         namedValues = {}
         for column_name, result in mean_shift_results.items():
             namedValues[column_name] = float(result.p_value)
             
         return namedValues
-        
+            
     except Exception as e:
-        logger.error(f"Error computing Meanshift: {str(e)}")
+        logger.error(f"Error computing Meanshift: {str(e)}", exc_info=True)
+        import traceback
+        logger.error(f"Stack trace: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Error computing metric: {str(e)}")
-
-
-@router.get("/metrics/drift/meanshift/definition")
-async def get_meanshift_definition():
-    """Provide a general definition of Meanshift metric."""
-    return {
-        "name": "Meanshift",
-        "description": "MeanShift gives the per-column probability that the data values seen in a test dataset come from the same distribution of a training dataset, under the assumption that the values are normally distributed.",
-        "interpretation": "Low p-values (below the threshold) indicate significant drift in the distribution of values.",
-        "thresholdMeaning": "P-value threshold for significance testing. Lower values require stronger evidence of drift.",
-    }
-
-
-@router.post("/metrics/drift/meanshift/request")
-async def schedule_meanshift(
-    request: MeanshiftMetricRequest, background_tasks: BackgroundTasks
-):
-    """Schedule a recurring computation of Meanshift metric."""
-    request_id = str(uuid.uuid4())
-    logger.info(f"Scheduling Meanshift computation with ID: {request_id}")
-    try:
-        # Validate model exists
-        model_data = ModelData(request.modelId)
-        input_rows, _, _ = await model_data.row_counts()
-
-        if input_rows == 0:
-            raise ValueError(f"No data found for model {request.modelId}")
-
-        # TODO: Store the schedule in the persistent storage
-        # This would involve creating a scheduled task entry with:
-        # - request_id
-        # - model_id
-        # - metric type (meanshift)
-        # - parameters (thresholdDelta, referenceTag, fitColumns, etc.)
-        # - schedule information
-
-        # For now, we just return the ID
-        return {"requestId": request_id}
-
-    except Exception as e:
-        logger.error(f"Error scheduling Meanshift: {str(e)}")
-        raise HTTPException(
-            status_code=500, detail=f"Error scheduling metric: {str(e)}"
-        )
-
-
-@router.delete("/metrics/drift/meanshift/request")
-async def delete_meanshift_schedule(schedule: ScheduleId):
-    """Delete a recurring computation of Meanshift metric."""
-    logger.info(f"Deleting Meanshift schedule: {schedule.requestId}")
-
-    try:
-        # TODO: Remove the schedule from the persistent storage
-        # This would involve deleting the scheduled task with the given ID
-
-        return {
-            "status": "success",
-            "message": f"Schedule {schedule.requestId} deleted",
-        }
-
-    except Exception as e:
-        logger.error(f"Error deleting Meanshift schedule: {str(e)}")
-        raise HTTPException(
-            status_code=500, detail=f"Error deleting schedule: {str(e)}"
-        )
-
-
-@router.get("/metrics/drift/meanshift/requests")
-async def list_meanshift_requests():
-    """List the currently scheduled computations of Meanshift metric."""
-    try:
-        # TODO: Retrieve scheduled tasks from the persistent storage
-        # This would involve querying all scheduled tasks of type meanshift
-
-        # For now, return empty list
-        return {"requests": []}
-
-    except Exception as e:
-        logger.error(f"Error listing Meanshift requests: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error listing requests: {str(e)}")
-

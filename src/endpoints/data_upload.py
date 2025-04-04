@@ -1,17 +1,18 @@
-from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
-from typing import Dict, Any, List, Optional
-import logging
+import base64
+import pickle
+import json
 import numpy as np
-from src.service.data.model_data import ModelData
-
+import logging
+import uuid
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from typing import Dict, Any, List, Optional, Tuple
+from src.service.data.storage import get_storage_interface
+from src.service.constants import INPUT_SUFFIX, OUTPUT_SUFFIX, METADATA_SUFFIX
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-
-# Create an in-memory data store for testing
-_test_data_store = {}
-_modeldata_patched = False
+storage_interface = get_storage_interface()
 
 class ModelInferJointPayload(BaseModel):
     model_name: str
@@ -21,152 +22,449 @@ class ModelInferJointPayload(BaseModel):
     response: Dict[str, Any]
 
 
-class SimpleDataPayload(BaseModel):
-    """Data payload for uploading test and reference data."""
-    featureNames: List[str]
-    referenceData: List[List[float]]
-    testData: List[List[float]]
-class TestDataPayload(BaseModel):
-    modelId: str
-    featureNames: List[str]
-    referenceData: List[List[float]]
-    testData: List[List[float]]
-    
-# --- ModelData patching ---
-def patch_model_data():
-    """Patch ModelData class to use our in-memory test data."""
-    global _modeldata_patched
-    if _modeldata_patched:
-        return  # Already patched
-        
-    # Store original methods
-    if not hasattr(ModelData, '_original_data'):
-        ModelData._original_data = ModelData.data
-    if not hasattr(ModelData, '_original_column_names'):
-        ModelData._original_column_names = ModelData.column_names
-        
-    # Override data method
-    async def new_data(self, start_row=None, n_rows=None, get_input=True, get_output=True, get_metadata=True):
-        """Use in-memory data instead of storage backend."""
-        logger.debug(f"ModelData.data called for model: {self.model_name}")
-        
-        # Check for model in data store
-        if self.model_name in _test_data_store:
-            logger.debug(f"Using in-memory data for {self.model_name}")
-            data = _test_data_store[self.model_name]
-            return (
-                data['inputs'] if get_input else None,
-                data['outputs'] if get_output else None,
-                data['metadata'] if get_metadata else None
-            )
-        
-        # Check with normalized ID
-        normalized_id = self.model_name.replace("_inputs", "")
-        if normalized_id in _test_data_store:
-            logger.debug(f"Using in-memory data for normalized ID: {normalized_id}")
-            data = _test_data_store[normalized_id]
-            return (
-                data['inputs'] if get_input else None,
-                data['outputs'] if get_output else None,
-                data['metadata'] if get_metadata else None
-            )
-            
-        # Fallback to original method
-        return await ModelData._original_data(self, start_row, n_rows, get_input, get_output, get_metadata)
-    
-    # Override column_names method
-    async def new_column_names(self):
-        """Use in-memory column names instead of storage backend."""
-        logger.debug(f"ModelData.column_names called for {self.model_name}")
-        
-        # Check for model in data store
-        if self.model_name in _test_data_store:
-            data = _test_data_store[self.model_name]
-            return (
-                data['input_names'],
-                data['output_names'],
-                data['metadata_names']
-            )
-        
-        # Check with normalized ID
-        normalized_id = self.model_name.replace("_inputs", "")
-        if normalized_id in _test_data_store:
-            data = _test_data_store[normalized_id]
-            return (
-                data['input_names'],
-                data['output_names'],
-                data['metadata_names']
-            )
-            
-        # Fallback to original method
-        return await ModelData._original_column_names(self)
-    
-    # Apply patches
-    ModelData.data = new_data
-    ModelData.column_names = new_column_names
-    _modeldata_patched = True
-    logger.info("ModelData patched to use in-memory test data")
+def get_numpy_dtype(kserve_dtype: str) -> np.dtype:
+    """Map KServe datatype to numpy dtype."""
+    dtype_map = {
+        "BOOL": np.bool_,
+        "UINT8": np.uint8,
+        "UINT16": np.uint16,
+        "UINT32": np.uint32,
+        "UINT64": np.uint64,
+        "INT8": np.int8,
+        "INT16": np.int16,
+        "INT32": np.int32,
+        "INT64": np.int64,
+        "FP16": np.float16,
+        "FP32": np.float32,
+        "FP64": np.float64,
+        "STRING": np.dtype('S64')
+    }
+    return dtype_map.get(kserve_dtype.upper(), np.float32)
 
 
-@router.post("/data/upload")
+async def parse_tensor(tensor: Dict[str, Any]) -> Tuple[np.ndarray, str]:
+    """Parse a single KServe tensor into a numpy array and name."""
+    name = tensor.get("name", "unknown")
+    shape = tensor.get("shape", [len(tensor.get("data", []))])
+    datatype = tensor.get("datatype", "FP32")
+    data = tensor.get("data", [])
+    
+    # Convert to numpy array
+    np_dtype = get_numpy_dtype(datatype)
+    array = np.array(data, dtype=np_dtype)
+    
+    # Reshape if needed
+    if shape:
+        try:
+            array = array.reshape(shape)
+        except ValueError as e:
+            raise ValueError(f"Cannot reshape data to {shape}: {str(e)}")
+    
+    return array, name
+
+
+async def combine_arrays(arrays: List[np.ndarray]) -> np.ndarray:
+    """Combine arrays for storage, ensuring 2D format."""
+    # Normalize dimensions to ensure 2D arrays (samples × features)
+    formatted = []
+    for array in arrays:
+        if len(array.shape) == 1:
+            # Convert 1D to 2D
+            formatted.append(array.reshape(-1, 1))
+        elif len(array.shape) > 2:
+            # Flatten dimensions after the first
+            formatted.append(array.reshape(array.shape[0], -1))
+        else:
+            # Already 2D
+            formatted.append(array)
+    
+    # Combine horizontally (concatenate features)
+    if len(formatted) == 1:
+        return formatted[0]
+    
+    try:
+        return np.hstack(formatted)
+    except ValueError as e:
+        raise ValueError(f"Failed to combine arrays: {str(e)}")
+
+
+async def create_metadata(sample_count: int, data_tag: Optional[str] = None) -> Tuple[List[Dict], List[str]]:
+    """Create metadata as a list of dictionaries."""
+    metadata_list = []
+    
+    # Generate execution IDs
+    for _ in range(sample_count):
+        item = {"execution_id": str(uuid.uuid4())}
+        if data_tag:
+            item["data_tag"] = data_tag
+        metadata_list.append(item)
+    
+    # Get all potential columns
+    all_keys = set()
+    for item in metadata_list:
+        all_keys.update(item.keys())
+    
+    return metadata_list, list(all_keys)
+
+async def read_metadata_safely(dataset_name: str) -> List[Dict]:
+    """Read metadata with format detection and fallback."""
+    try:
+        # Read data from storage
+        existing_data, existing_column_names = await storage_interface.read_data(dataset_name)
+        
+        # Add detailed logging to diagnose issues
+        logger.info(f"Read metadata format: dtype={getattr(existing_data, 'dtype', 'unknown')}, "
+                    f"type={type(existing_data)}, shape={getattr(existing_data, 'shape', 'unknown')}")
+        
+        # Check if it's our JSON-encoded metadata format
+        if 'metadata' in existing_column_names:
+            # It's in our JSON-encoded format
+            existing_list = []
+            for i in range(len(existing_data)):
+                try:
+                    # Try to decode the JSON string
+                    if hasattr(existing_data[i]['metadata'], 'decode'):
+                        json_str = existing_data[i]['metadata'].decode('utf-8').rstrip('\x00')
+                        item = json.loads(json_str)
+                        existing_list.append(item)
+                except Exception as e:
+                    logger.warning(f"Error decoding metadata item {i}: {e}")
+            
+            logger.info(f"Successfully read {len(existing_list)} metadata items in JSON format")
+            return existing_list
+            
+        # If we got here, data is in an unexpected format
+        logger.warning(f"Metadata is in an unexpected format, will reset and start fresh")
+        return []
+        
+    except Exception as e:
+        logger.warning(f"Error reading metadata: {e}, will reset and start fresh")
+        return []
+# async def read_metadata_safely(dataset_name: str) -> List[Dict]:
+#     """Read metadata with format detection and fallback."""
+#     try:
+#         # Try to read as a structured array first
+#         existing_data, existing_column_names = await storage_interface.read_data(dataset_name)
+        
+#         # Add detailed logging to diagnose issues
+#         logger.info(f"Read metadata format: dtype={getattr(existing_data, 'dtype', 'unknown')}, "
+#                     f"type={type(existing_data)}, shape={getattr(existing_data, 'shape', 'unknown')}")
+        
+#         # Check if it's a structured array with expected columns
+#         if (hasattr(existing_data, 'dtype') and 
+#             isinstance(existing_data.dtype.names, tuple) and
+#             len(existing_data.dtype.names) > 0):
+            
+#             # Convert structured array to list of dictionaries
+#             existing_list = []
+#             for i in range(len(existing_data)):
+#                 item = {}
+#                 for col in existing_column_names:
+#                     # Decode bytes to strings for string columns
+#                     if existing_data.dtype[col].kind == 'S':
+#                         try:
+#                             item[col] = existing_data[i][col].decode('utf-8').rstrip('\x00')
+#                         except UnicodeDecodeError:
+#                             item[col] = str(existing_data[i][col])
+#                     else:
+#                         item[col] = existing_data[i][col]
+#                 existing_list.append(item)
+            
+#             logger.info(f"Successfully read {len(existing_list)} metadata items in structured array format")
+#             return existing_list
+            
+#         # If we got here, data is in an unexpected format
+#         logger.warning(f"Metadata is in an unexpected format, will reset and start fresh")
+#         return []
+        
+#     except Exception as e:
+#         logger.warning(f"Error reading metadata: {e}, will reset and start fresh")
+#         return []
+
+
+# 1. Fix the write_metadata_directly function to ensure consistent column order
+async def write_metadata_directly(dataset_name: str, metadata_list: List[Dict], column_names: List[str]) -> None:
+    """Write metadata in a format compatible with the drift metrics code and HDF5 storage."""
+    logger.info(f"Writing metadata with {len(metadata_list)} items")
+    
+    # Create a structured dtype with these columns - make it large enough for pickled data
+    dtype_spec = [('metadata', 'S2000')]  # Increase buffer size for pickle protocol 0
+    
+    # Create a numpy structured array
+    metadata_array = np.zeros(len(metadata_list), dtype=np.dtype(dtype_spec))
+    
+    # Store each dictionary using pickle protocol 0 (ASCII, no NULL bytes)
+    for i, item in enumerate(metadata_list):
+        # Clean any bytes to strings
+        clean_item = {}
+        for k, v in item.items():
+            if isinstance(v, bytes):
+                clean_item[k] = v.decode('utf-8')
+            else:
+                clean_item[k] = v
+        
+        # Use protocol 0 which is ASCII-only with no NULL bytes
+        pickled_data = pickle.dumps(clean_item, protocol=0)
+        metadata_array[i]['metadata'] = pickled_data
+    
+    # Write the array
+    logger.info(f"Writing {len(metadata_list)} pickled metadata items (protocol 0)")
+    await storage_interface.write_data(dataset_name, metadata_array, ["metadata"])
+# async def write_metadata_directly(dataset_name: str, metadata_list: List[Dict], column_names: List[str]) -> None:
+#     """Write metadata in a format compatible with the drift metrics code and HDF5 storage."""
+#     logger.info(f"Writing metadata with {len(metadata_list)} items")
+    
+#     # Determine all keys from the metadata items
+#     all_keys = set()
+#     for item in metadata_list:
+#         all_keys.update(item.keys())
+    
+#     logger.info(f"Metadata keys: {all_keys}")
+    
+#     # Create a structured dtype with these columns in a specific order for consistency
+#     dtype_spec = []
+    
+#     # Always put execution_id and data_tag first in a specific order
+#     if 'execution_id' in all_keys:
+#         dtype_spec.append(('execution_id', 'S40'))  # UUID is 36 chars + buffer
+#         all_keys.remove('execution_id')
+    
+#     if 'data_tag' in all_keys:
+#         dtype_spec.append(('data_tag', 'S64'))  # Allow up to 64 chars for tag
+#         all_keys.remove('data_tag')
+    
+#     # Add remaining keys in alphabetical order for consistency
+#     for key in sorted(all_keys):
+#         dtype_spec.append((key, 'S64'))  # Default string length for others
+    
+#     # Create a numpy structured array with HDF5-compatible types
+#     metadata_array = np.zeros(len(metadata_list), dtype=np.dtype(dtype_spec))
+    
+#     # Fill the array with metadata values
+#     for i, item in enumerate(metadata_list):
+#         for key, value in item.items():
+#             if key in metadata_array.dtype.names:
+#                 if isinstance(value, str):
+#                     metadata_array[i][key] = value.encode('utf-8')
+#                 elif value is not None:
+#                     metadata_array[i][key] = str(value).encode('utf-8')
+    
+#     # Get the column names in the same order as the dtype
+#     column_names = [name for name, _ in dtype_spec]
+    
+#     # Write the structured array with explicitly ordered column names
+#     logger.info(f"Writing metadata with columns: {column_names}")
+#     await storage_interface.write_data(dataset_name, metadata_array, column_names)
+
+
+async def handle_numeric_dataset(dataset_name: str, new_data: np.ndarray, column_names: List[str]) -> None:
+    """Handle appending to numeric datasets."""
+    logger.info(f"Storing dataset {dataset_name} with shape {new_data.shape} and columns {column_names}")
+    
+    if not await storage_interface.dataset_exists(dataset_name):
+        # Create new dataset
+        logger.info(f"Creating new dataset: {dataset_name}")
+        await storage_interface.write_data(dataset_name, new_data, column_names)
+        # Verify data was written
+        if await storage_interface.dataset_exists(dataset_name):
+            logger.info(f"Successfully created dataset: {dataset_name}")
+        else:
+            logger.error(f"Failed to create dataset: {dataset_name}")
+        return
+    
+    # Read existing data
+    try:
+        existing_data, existing_column_names = await storage_interface.read_data(dataset_name)
+        logger.info(f"Read existing data from {dataset_name}: shape={existing_data.shape if hasattr(existing_data, 'shape') else 'unknown'}")
+        
+        # Verify column names match
+        if set(existing_column_names) != set(column_names):
+            logger.warning(f"Column mismatch in {dataset_name}: existing={existing_column_names}, new={column_names}")
+            raise ValueError(f"Column mismatch: existing={existing_column_names}, new={column_names}")
+        
+        # Combine data vertically
+        combined_data = np.vstack([existing_data, new_data])
+        logger.info(f"Combined data shape: {combined_data.shape}")
+        
+        # Delete and rewrite
+        await storage_interface.delete_dataset(dataset_name)
+        await storage_interface.write_data(dataset_name, combined_data, column_names)
+        
+        # Verify rewrite was successful
+        if await storage_interface.dataset_exists(dataset_name):
+            logger.info(f"Successfully updated dataset: {dataset_name}")
+        else:
+            logger.error(f"Failed to update dataset: {dataset_name}")
+    except Exception as e:
+        logger.error(f"Error handling numeric dataset {dataset_name}: {str(e)}", exc_info=True)
+        raise
+
+
+@router.post("/upload")
 async def upload_data(payload: ModelInferJointPayload):
     """Upload a batch of model data to TrustyAI."""
     try:
         logger.info(f"Received data upload for model: {payload.model_name}")
-        # TODO: Implement
-        return {"status": "success", "message": "Data uploaded successfully"}
+        
+        # Validate input payload
+        if not payload.request or "tensorPayloads" not in payload.request:
+            raise HTTPException(status_code=400, detail="No input tensors provided")
+        
+        # Parse input tensors
+        input_arrays = []
+        input_names = []
+        for tensor in payload.request.get("tensorPayloads", []):
+            array, name = await parse_tensor(tensor)
+            input_arrays.append(array)
+            input_names.append(name)
+        
+        if not input_arrays:
+            raise HTTPException(status_code=400, detail="No valid input tensors found")
+        
+        # Get sample count from first array
+        sample_count = input_arrays[0].shape[0]
+        
+        # Verify all inputs have same sample count
+        for i, arr in enumerate(input_arrays):
+            if arr.shape[0] != sample_count:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Input tensor '{input_names[i]}' has {arr.shape[0]} samples, expected {sample_count}"
+                )
+        
+        # Parse output tensors
+        if not payload.response or "tensorPayloads" not in payload.response:
+            raise HTTPException(status_code=400, detail="No output tensors provided")
+        
+        output_arrays = []
+        output_names = []
+        for tensor in payload.response.get("tensorPayloads", []):
+            array, name = await parse_tensor(tensor)
+            if array.shape[0] != sample_count:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Output tensor '{name}' has {array.shape[0]} samples, expected {sample_count}"
+                )
+            output_arrays.append(array)
+            output_names.append(name)
+        
+        if not output_arrays:
+            raise HTTPException(status_code=400, detail="No valid output tensors found")
+        
+        # Format data for storage
+        combined_inputs = await combine_arrays(input_arrays)
+        combined_outputs = await combine_arrays(output_arrays)
+        
+        # Create metadata
+        metadata_list, _ = await create_metadata(sample_count, payload.data_tag)
+        
+        # Save data
+        model_name = payload.model_name
+        
+        # Handle numeric data (inputs/outputs)
+        await handle_numeric_dataset(model_name + INPUT_SUFFIX, combined_inputs, input_names)
+        await handle_numeric_dataset(model_name + OUTPUT_SUFFIX, combined_outputs, output_names)
+        
+        # Handle metadata differently - always read, combine, and rewrite
+        metadata_dataset = model_name + METADATA_SUFFIX
+        if await storage_interface.dataset_exists(metadata_dataset):
+            # Use our safer reader
+            existing_list = await read_metadata_safely(metadata_dataset)
+            
+            # If we got any valid metadata, combine and write
+            if existing_list:
+                # Delete existing dataset
+                await storage_interface.delete_dataset(metadata_dataset)
+                
+                # Combine metadata
+                combined_metadata = existing_list + metadata_list
+                
+                # Get all keys
+                all_keys = set()
+                for item in combined_metadata:
+                    all_keys.update(item.keys())
+                
+                # Write combined metadata
+                logger.info(f"Writing combined metadata with {len(combined_metadata)} items")
+                await write_metadata_directly(metadata_dataset, combined_metadata, list(all_keys))
+            else:
+                # Just write new metadata
+                all_keys = set()
+                for item in metadata_list:
+                    all_keys.update(item.keys())
+                
+                logger.info(f"Writing fresh metadata with {len(metadata_list)} items")
+                await write_metadata_directly(metadata_dataset, metadata_list, list(all_keys))
+        else:
+            # Just write new metadata
+            all_keys = set()
+            for item in metadata_list:
+                all_keys.update(item.keys())
+            
+            logger.info(f"Writing initial metadata with {len(metadata_list)} items")
+            await write_metadata_directly(metadata_dataset, metadata_list, list(all_keys))
+        
+        return f"{sample_count} datapoints successfully added to {model_name} data."
+        
+    except ValueError as e:
+        logger.error(f"Error processing data: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Error uploading data: {str(e)}")
+        logger.error(f"Error uploading data: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error uploading data: {str(e)}")
-    
-class SimpleDataPayload(BaseModel):
-    """Data payload for uploading test and reference data."""
-    featureNames: List[str]
-    referenceData: List[List[float]]
-    testData: List[List[float]]
 
-@router.post("/test/simple-data/{model_id}")
-async def simple_data(model_id: str, payload: SimpleDataPayload):
-    """Load test data for drift metrics testing."""
-    try:
-        # Convert lists to numpy arrays
-        reference_data = np.array(payload.referenceData, dtype=np.float64)
-        test_data = np.array(payload.testData, dtype=np.float64)
-        
-        # Combine data
-        inputs = np.vstack([reference_data, test_data])
-        
-        # Create metadata with tags
-        ref_count = len(payload.referenceData)
-        test_count = len(payload.testData)
-        
-        metadata = np.empty((inputs.shape[0], 1), dtype='S10')
-        metadata[:ref_count] = b'reference'
-        metadata[ref_count:] = b'test'
-        
-        # Store data
-        _test_data_store[model_id] = {
-            'inputs': inputs, 
-            'outputs': np.array([]),
-            'metadata': metadata,
-            'input_names': payload.featureNames,
-            'output_names': [],
-            'metadata_names': ['data_tag']
-        }
-        
-        # Also store with _inputs suffix
-        _test_data_store[f"{model_id}_inputs"] = _test_data_store[model_id]
-        
-        # Patch ModelData
-        patch_model_data()
-        
-        return {
-            "status": "success",
-            "message": f"Test data loaded for {model_id}",
-            "data_shape": inputs.shape,
-            "reference_count": ref_count,
-            "test_count": test_count
-        }
-    except Exception as e:
-        logger.error(f"Error loading test data: {str(e)}")
-        return {"status": "error", "message": str(e)}
+
+@router.get("/check_datasets/{model_name}")
+async def check_datasets(model_name: str):
+    """Check if all required datasets for a model exist and return their details."""
+    result = {}
+    
+    # Check input dataset
+    input_dataset = model_name + INPUT_SUFFIX
+    if await storage_interface.dataset_exists(input_dataset):
+        try:
+            data, cols = await storage_interface.read_data(input_dataset)
+            result["inputs"] = {
+                "exists": True,
+                "shape": data.shape if hasattr(data, 'shape') else "unknown",
+                "columns": cols,
+                "sample": str(data[0]) if len(data) > 0 else "empty"
+            }
+        except Exception as e:
+            result["inputs"] = {"exists": True, "error": str(e)}
+    else:
+        result["inputs"] = {"exists": False}
+    
+    # Check output dataset
+    output_dataset = model_name + OUTPUT_SUFFIX
+    if await storage_interface.dataset_exists(output_dataset):
+        try:
+            data, cols = await storage_interface.read_data(output_dataset)
+            result["outputs"] = {
+                "exists": True,
+                "shape": data.shape if hasattr(data, 'shape') else "unknown",
+                "columns": cols,
+                "sample": str(data[0]) if len(data) > 0 else "empty"
+            }
+        except Exception as e:
+            result["outputs"] = {"exists": True, "error": str(e)}
+    else:
+        result["outputs"] = {"exists": False}
+    
+    # Check metadata dataset
+    metadata_dataset = model_name + METADATA_SUFFIX
+    if await storage_interface.dataset_exists(metadata_dataset):
+        try:
+            data, cols = await storage_interface.read_data(metadata_dataset)
+            result["metadata"] = {
+                "exists": True,
+                "shape": data.shape if hasattr(data, 'shape') else "unknown",
+                "columns": cols,
+                "sample": str(data[0]) if len(data) > 0 else "empty"
+            }
+        except Exception as e:
+            result["metadata"] = {"exists": True, "error": str(e)}
+    else:
+        result["metadata"] = {"exists": False}
+    
+    return result
