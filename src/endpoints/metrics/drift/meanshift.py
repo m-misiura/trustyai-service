@@ -88,7 +88,7 @@ async def compute_meanshift(request: MeanshiftMetricRequest):
                 else:
                     # raise an error if the expected format is not found
                     raise ValueError(f"Unexpected metadata format at row {i}")
-                
+        
                 if metadata_dict and 'data_tag' in metadata_dict:
                     tag = metadata_dict['data_tag']
                     available_tags.add(tag)

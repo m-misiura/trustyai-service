@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 from typing import Dict, Any, Tuple, List, Optional, Union
 import logging
 import numpy as np
@@ -16,10 +16,18 @@ storage_interface = get_storage_interface()
 
 class ModelInferJointPayload(BaseModel):
     model_name: str
-    data_tag: str = None
+    data_tag: Optional[str] = None
     is_ground_truth: bool = False
     request: Dict[str, Any]
     response: Dict[str, Any]
+    
+    @validator('model_name')
+    def validate_model_name(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Model name cannot be empty")
+        if "/" in v or ".." in v or "\\" in v:
+            raise ValueError("Model name contains invalid characters")
+        return v
 
 # --- Tensor Processing ---
 
@@ -46,9 +54,16 @@ class TensorParser:
         datatype = tensor.get("datatype", "FP32")
         data = tensor.get("data", [])
         
+        # Input validation
+        if not data:
+            raise ValueError(f"Tensor '{name}' contains no data")
+            
         # Convert to numpy array
-        np_dtype = cls.get_numpy_dtype(datatype)
-        array = np.array(data, dtype=np_dtype)
+        try:
+            np_dtype = cls.get_numpy_dtype(datatype)
+            array = np.array(data, dtype=np_dtype)
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Failed to convert tensor '{name}' to {datatype}: {str(e)}")
         
         # Reshape if needed
         if shape:
@@ -62,6 +77,9 @@ class TensorParser:
     @staticmethod
     async def combine_arrays(arrays: List[np.ndarray]) -> np.ndarray:
         """Combine arrays for storage, ensuring 2D format."""
+        if not arrays:
+            raise ValueError("No arrays to combine")
+            
         # Normalize dimensions to ensure 2D arrays (samples × features)
         formatted = []
         for array in arrays:
@@ -203,9 +221,21 @@ class DataStorageHandler:
             combined_data = np.vstack([existing_data, new_data])
             logger.info(f"Combined data shape: {combined_data.shape}")
             
-            # Delete and rewrite
+            # Safer approach: write to new dataset first, then delete old
+            temp_dataset = dataset_name + "_temp"
+            
+            # Write combined data to temp
+            await storage_interface.write_data(temp_dataset, combined_data, column_names)
+            
+            # Delete old dataset
             await storage_interface.delete_dataset(dataset_name)
+            
+            # Write to final destination 
             await storage_interface.write_data(dataset_name, combined_data, column_names)
+            
+            # Clean up temp
+            await storage_interface.delete_dataset(temp_dataset)
+            
             logger.info(f"Successfully updated dataset: {dataset_name}")
             
         except Exception as e:
@@ -224,9 +254,6 @@ class DataStorageHandler:
                 
                 # If we got valid metadata, combine and write
                 if existing_list:
-                    # Delete existing dataset
-                    await storage_interface.delete_dataset(metadata_dataset)
-                    
                     # Combine metadata
                     combined_metadata = existing_list + metadata_list
                     
@@ -235,8 +262,18 @@ class DataStorageHandler:
                     for item in combined_metadata:
                         all_keys.update(item.keys())
                     
-                    # Write combined metadata
+                    # Write to temp first
+                    temp_dataset = metadata_dataset + "_temp"
+                    await MetadataManager.write_metadata(temp_dataset, combined_metadata, list(all_keys))
+                    
+                    # Delete original
+                    await storage_interface.delete_dataset(metadata_dataset)
+                    
+                    # Write final
                     await MetadataManager.write_metadata(metadata_dataset, combined_metadata, list(all_keys))
+                    
+                    # Clean up temp
+                    await storage_interface.delete_dataset(temp_dataset)
                 else:
                     # Just write new metadata
                     all_keys = set()

@@ -1,11 +1,17 @@
 from fastapi import APIRouter, HTTPException, BackgroundTasks
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Dict, List, Optional, Any
+from src.service.metrics.drift.ks_test.approx_ks_test import ApproxKSTest
+from src.service.metrics.drift.ks_test.approx_ks_fitting import ApproxKSFitting
+from src.service.constants import INPUT_SUFFIX, METADATA_SUFFIX
+from src.service.data.storage import get_storage_interface
 import logging
+import numpy as np
 import uuid
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+storage_interface = get_storage_interface()
 
 
 class ScheduleId(BaseModel):
@@ -13,14 +19,6 @@ class ScheduleId(BaseModel):
 
 
 # ApproxKSTest
-class GKSketch(BaseModel):
-    epsilon: float
-    summary: List[Dict[str, Any]] = []
-    xmin: float
-    xmax: float
-    numx: int
-
-
 class ApproxKSTestMetricRequest(BaseModel):
     modelId: str
     requestName: Optional[str] = None
@@ -28,20 +26,131 @@ class ApproxKSTestMetricRequest(BaseModel):
     batchSize: Optional[int] = 100
     thresholdDelta: Optional[float] = None
     referenceTag: Optional[str] = None
-    fitColumns: List[str] = []
-    epsilon: Optional[float] = None
-    sketchFitting: Optional[Dict[str, GKSketch]] = None
+    epsilon: float = Field(0.01, description="Maximum error for the approximate KS test")
+    sketchFitting: Optional[Dict[str, Any]] = None
 
 
 @router.post("/metrics/drift/approxkstest")
 async def compute_approxkstest(request: ApproxKSTestMetricRequest):
-    """Compute the current value of ApproxKSTest metric."""
+    """Compute the ApproxKSTest metric."""
     try:
-        logger.info(f"Computing ApproxKSTest for model: {request.modelId}")
-        # TODO: Implement
-        return {"status": "success", "value": 0.5}
+        model_id = request.modelId
+        reference_tag = request.referenceTag
+        epsilon = request.epsilon
+        logger.info(f"Computing ApproxKSTest for model: {model_id}, reference tag: {reference_tag}, epsilon: {epsilon}")
+        
+        # Access datasets
+        input_dataset = model_id + INPUT_SUFFIX
+        metadata_dataset = model_id + METADATA_SUFFIX
+        
+        # Check datasets exist
+        if not await storage_interface.dataset_exists(input_dataset):
+            return {"error": f"Input dataset {input_dataset} does not exist"}
+        
+        if not await storage_interface.dataset_exists(metadata_dataset):
+            return {"error": f"Metadata dataset {metadata_dataset} does not exist"}
+        
+        # Read input data
+        input_data, input_names = await storage_interface.read_data(input_dataset)
+        logger.info(f"Read input data: shape={input_data.shape}, columns={input_names}")
+        
+        # Ensure input_names is a list
+        if isinstance(input_names, np.ndarray):
+            input_names = input_names.tolist()
+        
+        # Read metadata
+        metadata_data, metadata_names = await storage_interface.read_data(metadata_dataset)
+        logger.info(f"Read metadata: length={len(metadata_data)}, columns={metadata_names}")
+        
+        # Extract reference and test data indices
+        ref_indices = []
+        test_indices = []
+        available_tags = set()
+        
+        # Process metadata
+        if len(metadata_data) == 0:
+            return {"error": "No metadata found"}
+            
+        sample_row = metadata_data[0]
+        logger.info(f"Sample metadata type: {type(sample_row)}")
+        
+        # Process all metadata rows
+        for i in range(len(metadata_data)):
+            try:
+                row = metadata_data[i]
+                metadata_dict = None
+                
+                if isinstance(row, dict) and 'data_tag' in row:
+                    # Handle direct dictionary format
+                    metadata_dict = row
+                else:
+                    # raise an error if the expected format is not found
+                    raise ValueError(f"Unexpected metadata format at row {i}")
+        
+                if metadata_dict and 'data_tag' in metadata_dict:
+                    tag = metadata_dict['data_tag']
+                    available_tags.add(tag)
+                    
+                    if i < 3:
+                        logger.info(f"Row {i} has tag: {tag}")
+                    
+                    if tag == reference_tag:
+                        ref_indices.append(i)
+                    else:
+                        test_indices.append(i)
+                        
+            except Exception as e:
+                logger.warning(f"Error processing metadata row {i}: {str(e)}")
+        
+        logger.info(f"Available tags: {available_tags}")
+        logger.info(f"Found {len(ref_indices)} reference rows and {len(test_indices)} test rows")
+        
+        # Check if we have enough data
+        if not ref_indices:
+            if reference_tag:
+                return {"error": f"No reference data found with tag '{reference_tag}'. Available tags: {list(available_tags)}"}
+            else:
+                return {"error": "No reference tag specified and no default reference data found"}
+                
+        if not test_indices:
+            return {"error": "No test data found"}
+        
+        # Extract reference and test data
+        ref_data = input_data[ref_indices]
+        test_data = input_data[test_indices]
+        
+        logger.info(f"Reference data shape: {ref_data.shape}, Test data shape: {test_data.shape}")
+        
+        # Initialize ApproxKSTest
+        if request.sketchFitting:
+            # Use provided sketches
+            logger.info("Using provided sketch fitting")
+            approx_ks_fitting = ApproxKSFitting(request.sketchFitting)
+            approx_ks = ApproxKSTest(eps=epsilon, approx_ks_fitting=approx_ks_fitting)
+        else:
+            # Precompute sketches from reference data
+            logger.info("Computing sketch fitting from reference data")
+            approx_ks = ApproxKSTest(eps=epsilon, train_data=ref_data, column_names=input_names)
+        
+        # Calculate ApproxKSTest result
+        threshold = request.thresholdDelta or 0.05
+        logger.info(f"Computing ApproxKSTest with threshold={threshold}")
+        
+        ks_test_results = approx_ks.calculate(
+            test_data=test_data, 
+            column_names=input_names,
+            alpha=threshold
+        )
+        
+        # Format results - extract p-values for the response
+        namedValues = {}
+        for column_name, result in ks_test_results.items():
+            namedValues[column_name] = float(result.get_p_value())
+            
+        return namedValues
+            
     except Exception as e:
-        logger.error(f"Error computing ApproxKSTest: {str(e)}")
+        logger.error(f"Error computing ApproxKSTest: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error computing metric: {str(e)}")
 
 
@@ -50,7 +159,9 @@ async def get_approxkstest_definition():
     """Provide a general definition of ApproxKSTest metric."""
     return {
         "name": "Approximate Kolmogorov-Smirnov Test",
-        "description": "Description.",
+        "description": "ApproxKSTest calculates an approximate Kolmogorov-Smirnov test, and ensures that the maximum error is 6*epsilon as compared to an exact KS Test.",
+        "interpretation": "Low p-values (below the threshold) indicate significant drift in the distribution of values.",
+        "thresholdMeaning": "P-value threshold for significance testing. Lower values require stronger evidence of drift."
     }
 
 
