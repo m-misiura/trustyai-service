@@ -1,25 +1,39 @@
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, validator, Field
 from typing import Dict, Any, Tuple, List, Optional, Union
 import logging
 import numpy as np
 import uuid
 import pickle
 import json
+import re
+import os
+import h5py
 
 from src.service.data.storage import get_storage_interface
 from src.service.constants import INPUT_SUFFIX, OUTPUT_SUFFIX, METADATA_SUFFIX
+from src.service.data.parsers import TensorParser
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 storage_interface = get_storage_interface()
 
+class TensorPayload(BaseModel):
+    name: str
+    data: List[Any]
+    datatype: str = "FP32"
+    shape: Optional[List[int]] = None
+    executionIDs: Optional[List[str]] = None
+
+class RequestResponse(BaseModel):
+    tensorPayloads: List[TensorPayload]
+
 class ModelInferJointPayload(BaseModel):
     model_name: str
     data_tag: Optional[str] = None
     is_ground_truth: bool = False
-    request: Dict[str, Any]
-    response: Dict[str, Any]
+    request: RequestResponse
+    response: RequestResponse
     
     @validator('model_name')
     def validate_model_name(cls, v):
@@ -28,79 +42,14 @@ class ModelInferJointPayload(BaseModel):
         if "/" in v or ".." in v or "\\" in v:
             raise ValueError("Model name contains invalid characters")
         return v
-
-# --- Tensor Processing ---
-
-class TensorParser:
-    """Handles parsing and processing of KServe tensor formats"""
-    
-    @staticmethod
-    def get_numpy_dtype(kserve_dtype: str) -> np.dtype:
-        """Map KServe datatype to numpy dtype."""
-        dtype_map = {
-            "BOOL": np.bool_,
-            "UINT8": np.uint8, "UINT16": np.uint16, "UINT32": np.uint32, "UINT64": np.uint64,
-            "INT8": np.int8, "INT16": np.int16, "INT32": np.int32, "INT64": np.int64,
-            "FP16": np.float16, "FP32": np.float32, "FP64": np.float64,
-            "STRING": np.dtype('S64')
-        }
-        return dtype_map.get(kserve_dtype.upper(), np.float32)
-    
-    @classmethod
-    async def parse_tensor(cls, tensor: Dict[str, Any]) -> Tuple[np.ndarray, str]:
-        """Parse a single KServe tensor into a numpy array and name."""
-        name = tensor.get("name", "unknown")
-        shape = tensor.get("shape", [len(tensor.get("data", []))])
-        datatype = tensor.get("datatype", "FP32")
-        data = tensor.get("data", [])
         
-        # Input validation
-        if not data:
-            raise ValueError(f"Tensor '{name}' contains no data")
-            
-        # Convert to numpy array
-        try:
-            np_dtype = cls.get_numpy_dtype(datatype)
-            array = np.array(data, dtype=np_dtype)
-        except (ValueError, TypeError) as e:
-            raise ValueError(f"Failed to convert tensor '{name}' to {datatype}: {str(e)}")
-        
-        # Reshape if needed
-        if shape:
-            try:
-                array = array.reshape(shape)
-            except ValueError as e:
-                raise ValueError(f"Cannot reshape tensor '{name}' to {shape}: {str(e)}")
-        
-        return array, name
-    
-    @staticmethod
-    async def combine_arrays(arrays: List[np.ndarray]) -> np.ndarray:
-        """Combine arrays for storage, ensuring 2D format."""
-        if not arrays:
-            raise ValueError("No arrays to combine")
-            
-        # Normalize dimensions to ensure 2D arrays (samples × features)
-        formatted = []
-        for array in arrays:
-            if len(array.shape) == 1:
-                # Convert 1D to 2D
-                formatted.append(array.reshape(-1, 1))
-            elif len(array.shape) > 2:
-                # Flatten dimensions after the first
-                formatted.append(array.reshape(array.shape[0], -1))
-            else:
-                # Already 2D
-                formatted.append(array)
-        
-        # Combine horizontally (concatenate features)
-        if len(formatted) == 1:
-            return formatted[0]
-        
-        try:
-            return np.hstack(formatted)
-        except ValueError as e:
-            raise ValueError(f"Failed to combine arrays: {str(e)}")
+    @validator('data_tag')
+    def validate_data_tag(cls, v):
+        if v is not None:
+            if not v.strip():
+                raise ValueError("Data tag cannot be empty if provided")
+            # Add any specific validation rules for data tags
+        return v
 
 # --- Metadata Management ---
 
@@ -128,37 +77,78 @@ class MetadataManager:
     
     @staticmethod
     async def read_metadata_safely(dataset_name: str) -> List[Dict]:
-        """Read metadata with format detection and fallback."""
+        """Read metadata directly from HDF5 file with specialized handling for the TrustyAI format."""
         try:
-            # Read data from storage
-            existing_data, existing_column_names = await storage_interface.read_data(dataset_name)
+            storage_interface_instance = get_storage_interface()
+            data_directory = getattr(storage_interface_instance, "data_directory", "/tmp/trustyai-data")
             
-            logger.info(f"Read metadata format: dtype={getattr(existing_data, 'dtype', 'unknown')}, "
-                        f"type={type(existing_data)}, shape={getattr(existing_data, 'shape', 'unknown')}")
+            # Get the direct path to the HDF5 file
+            file_path = os.path.join(data_directory, f"{dataset_name}_trustyai_data")
+            logger.info(f"Attempting to read metadata directly from: {file_path}")
             
-            # Check if it's our JSON-encoded metadata format
-            if 'metadata' in existing_column_names:
-                # It's in our JSON-encoded format
-                existing_list = []
-                for i in range(len(existing_data)):
-                    try:
-                        # Try to decode the JSON string
-                        if hasattr(existing_data[i]['metadata'], 'decode'):
-                            json_str = existing_data[i]['metadata'].decode('utf-8').rstrip('\x00')
-                            item = json.loads(json_str)
-                            existing_list.append(item)
-                    except Exception as e:
-                        logger.warning(f"Error decoding metadata item {i}: {e}")
+            # Check if the file exists
+            if not os.path.exists(file_path):
+                logger.warning(f"Metadata file does not exist: {file_path}")
+                return []
+            
+            metadata_list = []
+            
+            # Open the file directly with h5py
+            try:
+                with h5py.File(file_path, 'r') as f:
+                    # Check if the dataset exists
+                    if dataset_name in f:
+                        # Get the dataset
+                        dataset = f[dataset_name]
+                        
+                        # Check if there's metadata
+                        if 'metadata' in dataset.dtype.names:
+                            logger.info(f"Found metadata column in dataset {dataset_name}")
+                            
+                            # Process each row
+                            for i in range(len(dataset)):
+                                try:
+                                    # Get the metadata bytes
+                                    metadata_bytes = dataset[i]['metadata']
+                                    
+                                    # First try pickle deserialization
+                                    try:
+                                        # Clean the data and try pickle
+                                        clean_bytes = metadata_bytes.rstrip(b'\x00')
+                                        metadata_dict = pickle.loads(clean_bytes, encoding='latin1')
+                                        metadata_list.append(metadata_dict)
+                                        continue
+                                    except Exception as pickle_error:
+                                        # If pickle fails, try manual extraction with regex
+                                        logger.debug(f"Pickle deserialization failed for item {i}: {pickle_error}")
+                                    
+                                    # Convert bytes to string for regex processing
+                                    metadata_str = metadata_bytes.decode('latin1', errors='replace')
+                                    
+                                    # Extract with regex patterns
+                                    metadata_dict = {}
+                                    
+                                    # Extract execution_id
+                                    execution_id_match = re.search(r'execution_id.*?\'([^\']+)\'', metadata_str)
+                                    if execution_id_match:
+                                        metadata_dict['execution_id'] = execution_id_match.group(1)
+                                    
+                                    # Extract data_tag
+                                    data_tag_match = re.search(r'data_tag.*?\'([^\']+)\'', metadata_str)
+                                    if data_tag_match:
+                                        metadata_dict['data_tag'] = data_tag_match.group(1)
+                                    
+                                    if metadata_dict:
+                                        metadata_list.append(metadata_dict)
+                                except Exception as row_error:
+                                    logger.warning(f"Error decoding metadata row {i}: {row_error}")
+            except Exception as file_error:
+                logger.error(f"Error opening HDF5 file {file_path}: {file_error}")
                 
-                logger.info(f"Successfully read {len(existing_list)} metadata items in JSON format")
-                return existing_list
-                
-            # If we got here, data is in an unexpected format
-            logger.warning(f"Metadata is in an unexpected format, will reset and start fresh")
-            return []
-            
+            logger.info(f"Successfully read {len(metadata_list)} metadata items")
+            return metadata_list
         except Exception as e:
-            logger.warning(f"Error reading metadata: {e}, will reset and start fresh")
+            logger.error(f"Error reading metadata: {e}", exc_info=True)
             return []
     
     @staticmethod
@@ -293,6 +283,148 @@ class DataStorageHandler:
             logger.error(f"Error handling metadata for {model_name}: {str(e)}", exc_info=True)
             raise
 
+# --- Ground Truth Handling ---
+
+class GroundTruthHandler:
+    """Handles validation and processing of ground truth data"""
+    
+    @staticmethod
+    async def compare_features(original_features, uploaded_features):
+        """Compare original features with uploaded features and generate detailed mismatch report"""
+        if len(original_features) != len(uploaded_features):
+            return False, f"Feature count mismatch: original={len(original_features)}, uploaded={len(uploaded_features)}"
+        
+        mismatches = []
+        for i, (orig, uploaded) in enumerate(zip(original_features, uploaded_features)):
+            if not np.array_equal(orig, uploaded):
+                mismatches.append(f"Feature {i}: original={orig}, uploaded={uploaded}")
+        
+        if mismatches:
+            mismatch_report = "\n".join(mismatches)
+            return False, f"Feature value mismatches:\n{mismatch_report}"
+        
+        return True, ""
+    
+    @staticmethod
+    async def compare_outputs(original_outputs, uploaded_outputs):
+        """Compare original outputs with uploaded outputs and generate detailed mismatch report"""
+        if len(original_outputs) != len(uploaded_outputs):
+            return False, f"Output count mismatch: original={len(original_outputs)}, uploaded={len(uploaded_outputs)}"
+        
+        mismatches = []
+        for i, (orig, uploaded) in enumerate(zip(original_outputs, uploaded_outputs)):
+            if not np.array_equal(orig, uploaded):
+                mismatches.append(f"Output {i}: original={orig}, uploaded={uploaded}")
+        
+        if mismatches:
+            mismatch_report = "\n".join(mismatches)
+            return False, f"Output value mismatches:\n{mismatch_report}"
+        
+        return True, ""
+    
+    @staticmethod
+    async def handle_ground_truths(payload, input_arrays, input_names, output_arrays, output_names, execution_ids):
+        """Process ground truth data with validation against existing data"""
+        model_name = payload.model_name
+        
+        if not execution_ids:
+            raise ValueError("No execution IDs provided. When uploading ground truths, all inputs must have a corresponding execution ID.")
+        
+        # Check if model data exists
+        input_dataset = model_name + INPUT_SUFFIX
+        output_dataset = model_name + OUTPUT_SUFFIX
+        metadata_dataset = model_name + METADATA_SUFFIX
+        
+        if not await storage_interface.dataset_exists(input_dataset):
+            raise ValueError(f"No TrustyAI data named {model_name} found. Ground truths can only be uploaded for existing data.")
+        
+        # Read existing data
+        existing_inputs, existing_input_names = await storage_interface.read_data(input_dataset)
+        existing_outputs, existing_output_names = await storage_interface.read_data(output_dataset)
+        existing_metadata = await MetadataManager.read_metadata_safely(metadata_dataset)
+        
+        # Create mapping of execution_id to row index
+        id_to_idx = {}
+        for i, metadata in enumerate(existing_metadata):
+            if "execution_id" in metadata:
+                id_to_idx[metadata["execution_id"]] = i
+        
+        # Check each provided ground truth against existing data
+        ground_truth_metadata = []
+        ground_truth_outputs = []
+        row_mismatch_errors = []
+        
+        for i, exec_id in enumerate(execution_ids):
+            if exec_id not in id_to_idx:
+                row_mismatch_errors.append(f"Execution ID {exec_id} not found in existing data")
+                continue
+                
+            idx = id_to_idx[exec_id]
+            
+            # Extract the row from existing inputs
+            existing_row = existing_inputs[idx]
+            
+            # Extract the input row we're validating
+            current_row = input_arrays[0][i] if len(input_arrays) == 1 else np.hstack([arr[i:i+1] for arr in input_arrays])
+            
+            # Compare input features
+            inputs_match, input_error = await GroundTruthHandler.compare_features(existing_row, current_row)
+            if not inputs_match:
+                row_mismatch_errors.append(f"ID={exec_id}: {input_error}")
+                continue
+            
+            # Outputs match, so we can add this ground truth
+            ground_truth_metadata.append({
+                "execution_id": exec_id,
+                "is_ground_truth": True,
+                "data_tag": payload.data_tag if payload.data_tag else "ground_truth"
+            })
+            
+            # Extract the output row we're saving
+            output_row = output_arrays[0][i] if len(output_arrays) == 1 else np.hstack([arr[i:i+1] for arr in output_arrays])
+            ground_truth_outputs.append(output_row)
+        
+        # If any mismatches, raise error
+        if row_mismatch_errors:
+            mismatch_report = "\n".join(row_mismatch_errors)
+            raise ValueError(f"Found mismatches between uploaded data and recorded data:\n{mismatch_report}")
+        
+        if not ground_truth_metadata:
+            raise ValueError("No valid ground truths found in uploaded data")
+        
+        # Convert to numpy array for storage
+        ground_truth_outputs_array = np.vstack(ground_truth_outputs)
+        
+        # Define a ground truth dataset name
+        ground_truth_dataset = model_name + "_ground_truths"
+        ground_truth_metadata_dataset = ground_truth_dataset + METADATA_SUFFIX
+        
+        # Save ground truth data
+        if await storage_interface.dataset_exists(ground_truth_dataset):
+            # Read existing ground truths
+            existing_ground_truths, existing_ground_truth_names = await storage_interface.read_data(ground_truth_dataset)
+            
+            # Validate column names match
+            if set(existing_ground_truth_names) != set(output_names):
+                raise ValueError(f"Ground truth output names mismatch: existing={existing_ground_truth_names}, new={output_names}")
+            
+            # Combine with existing ground truths
+            combined_ground_truths = np.vstack([existing_ground_truths, ground_truth_outputs_array])
+            
+            # Save combined ground truths
+            await DataStorageHandler.handle_dataset(ground_truth_dataset, combined_ground_truths, output_names)
+            
+            # Handle metadata
+            await DataStorageHandler.handle_metadata(ground_truth_dataset, ground_truth_metadata)
+        else:
+            # Create new ground truth dataset
+            await DataStorageHandler.handle_dataset(ground_truth_dataset, ground_truth_outputs_array, output_names)
+            
+            # Handle metadata
+            await DataStorageHandler.handle_metadata(ground_truth_dataset, ground_truth_metadata)
+        
+        return f"{len(ground_truth_metadata)} ground truths successfully added to {ground_truth_dataset}."
+
 # --- Main Service Class ---
 
 class DataUploadService:
@@ -304,16 +436,23 @@ class DataUploadService:
         logger.info(f"Processing data upload for model: {payload.model_name}")
         
         # Validate input payload
-        if not payload.request or "tensorPayloads" not in payload.request:
+        if not payload.request or not payload.request.tensorPayloads:
             raise ValueError("No input tensors provided")
         
         # Parse input tensors
         input_arrays = []
         input_names = []
-        for tensor in payload.request.get("tensorPayloads", []):
+        execution_ids = None
+        
+        for tensor in payload.request.tensorPayloads:
             array, name = await TensorParser.parse_tensor(tensor)
             input_arrays.append(array)
             input_names.append(name)
+            
+            # Extract execution IDs from the first tensor if available
+            if tensor.executionIDs and execution_ids is None:
+                execution_ids = tensor.executionIDs
+                logger.info(f"Found {len(execution_ids)} execution IDs in tensor '{name}'")
         
         if not input_arrays:
             raise ValueError("No valid input tensors found")
@@ -326,13 +465,17 @@ class DataUploadService:
             if arr.shape[0] != sample_count:
                 raise ValueError(f"Input tensor '{input_names[i]}' has {arr.shape[0]} samples, expected {sample_count}")
         
+        # Check execution IDs match sample count
+        if execution_ids and len(execution_ids) != sample_count:
+            raise ValueError(f"Mismatch between number of samples ({sample_count}) and execution IDs ({len(execution_ids)})")
+        
         # Parse output tensors
-        if not payload.response or "tensorPayloads" not in payload.response:
+        if not payload.response or not payload.response.tensorPayloads:
             raise ValueError("No output tensors provided")
         
         output_arrays = []
         output_names = []
-        for tensor in payload.response.get("tensorPayloads", []):
+        for tensor in payload.response.tensorPayloads:
             array, name = await TensorParser.parse_tensor(tensor)
             if array.shape[0] != sample_count:
                 raise ValueError(f"Output tensor '{name}' has {array.shape[0]} samples, expected {sample_count}")
@@ -346,20 +489,53 @@ class DataUploadService:
         combined_inputs = await TensorParser.combine_arrays(input_arrays)
         combined_outputs = await TensorParser.combine_arrays(output_arrays)
         
-        # Create metadata
-        metadata_list, _ = await MetadataManager.create_metadata(sample_count, payload.data_tag)
-        
-        # Save data
-        model_name = payload.model_name
-        
-        # Handle numeric data (inputs/outputs)
-        await DataStorageHandler.handle_dataset(model_name + INPUT_SUFFIX, combined_inputs, input_names)
-        await DataStorageHandler.handle_dataset(model_name + OUTPUT_SUFFIX, combined_outputs, output_names)
-        
-        # Handle metadata
-        await DataStorageHandler.handle_metadata(model_name, metadata_list)
-        
-        return f"{sample_count} datapoints successfully added to {model_name} data."
+        # Handle ground truth vs. regular data upload
+        if payload.is_ground_truth:
+            if not execution_ids:
+                raise ValueError("Ground truth uploads require execution IDs to match with existing data")
+                
+            # Process and validate ground truths
+            return await GroundTruthHandler.handle_ground_truths(
+                payload,
+                input_arrays, 
+                input_names, 
+                output_arrays, 
+                output_names, 
+                execution_ids
+            )
+        else:
+            # Regular data upload process
+            if execution_ids:
+                logger.info("Execution IDs were provided but this is not a ground truth upload - IDs will be used for metadata")
+            
+            # Create metadata with proper handling of execution IDs
+            if execution_ids:
+                metadata_list = []
+                for i, exec_id in enumerate(execution_ids):
+                    item = {"execution_id": exec_id}
+                    if payload.data_tag:
+                        item["data_tag"] = payload.data_tag
+                    metadata_list.append(item)
+            else:
+                # Generate new execution IDs
+                metadata_list, _ = await MetadataManager.create_metadata(sample_count, payload.data_tag)
+            
+            # Save data
+            model_name = payload.model_name
+            
+            # Handle data tagging validation
+            if payload.data_tag:
+                # Add validation for data tag if needed
+                logger.info(f"Data will be tagged with '{payload.data_tag}'")
+            
+            # Handle numeric data (inputs/outputs)
+            await DataStorageHandler.handle_dataset(model_name + INPUT_SUFFIX, combined_inputs, input_names)
+            await DataStorageHandler.handle_dataset(model_name + OUTPUT_SUFFIX, combined_outputs, output_names)
+            
+            # Handle metadata
+            await DataStorageHandler.handle_metadata(model_name, metadata_list)
+            
+            return f"{sample_count} datapoints successfully added to {model_name} data."
 
 # --- API Endpoints ---
 
@@ -367,8 +543,35 @@ class DataUploadService:
 async def upload_data(payload: ModelInferJointPayload):
     """Upload a batch of model data to TrustyAI."""
     try:
+        # Validate request structure
+        if not payload.request or not payload.request.tensorPayloads or len(payload.request.tensorPayloads) < 1:
+            raise ValueError("Directly uploaded datapoints must specify at least one input tensor.")
+            
+        # Validate model name
+        if not payload.model_name or not payload.model_name.strip():
+            raise ValueError("Model name cannot be empty")
+            
+        # Validate ground truth requirements
+        if payload.is_ground_truth:
+            # Check for execution IDs
+            has_execution_ids = False
+            for tensor in payload.request.tensorPayloads:
+                if tensor.executionIDs and len(tensor.executionIDs) > 0:
+                    has_execution_ids = True
+                    break
+                    
+            if not has_execution_ids:
+                raise ValueError("No execution IDs were provided. When uploading ground truths, all inputs must have a corresponding "
+                                "TrustyAI Execution ID to correlate them with existing inferences.")
+                
+            # Check if the model exists
+            if not await storage_interface.dataset_exists(payload.model_name + INPUT_SUFFIX):
+                raise ValueError(f"No TrustyAI dataframe named {payload.model_name}. Ground truths can only be uploaded for extant dataframes.")
+                
+        # Process the upload
         result = await DataUploadService.process_upload(payload)
-        return result
+        return {"message": result}
+        
     except ValueError as e:
         logger.error(f"Error processing data: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))

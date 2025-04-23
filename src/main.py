@@ -50,6 +50,7 @@ app.add_middleware(
 app.include_router(consumer_router, tags=["{Internal Only} Inference Consumer"])
 app.include_router(dir_router, tags=["Fairness Metrics: Group: Disparate Impact Ratio"])
 app.include_router(data_upload_router, prefix="/data",  tags=["Data Upload"])
+app.include_router(data_download_router, prefix="/data",  tags=["Data Download"])
 # app.include_router(
 #     drift_metrics_router,
 #     tags=[
