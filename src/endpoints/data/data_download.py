@@ -11,6 +11,12 @@ import re
 
 from src.service.data.storage import get_storage_interface
 from src.service.constants import INPUT_SUFFIX, OUTPUT_SUFFIX, METADATA_SUFFIX
+from src.service.utils import list_utils
+
+# Import shared utilities to avoid duplication
+from src.endpoints.consumer.consumer_endpoint import (
+    KServeData, KServeInferenceRequest, KServeInferenceResponse
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -52,14 +58,21 @@ class RowMatcher(BaseModel):
             raise ValueError(f"BETWEEN operation requires exactly 2 values, got {len(v)}")
         return v
 
+class OutputFormat(str, Enum):
+    CSV = "csv"
+    KSERVE = "kserve"
+
 class DataRequestPayload(BaseModel):
     modelId: str
     matchAny: List[RowMatcher] = []
     matchAll: List[RowMatcher] = []
     matchNone: List[RowMatcher] = []
+    format: Optional[OutputFormat] = OutputFormat.CSV
 
 class DataResponsePayload(BaseModel):
-    dataCSV: str
+    dataCSV: Optional[str] = None
+    kserveRequest: Optional[Dict] = None
+    kserveResponse: Optional[Dict] = None
 
 # Utility functions for data types and conversions
 class DataTypeUtils:
@@ -295,9 +308,77 @@ class CSVConverter:
         
         return output.getvalue()
 
+class KServeConverter:
+    """Utility for converting data to KServe format"""
+    
+    @staticmethod
+    def numpy_to_kserve(filtered_data: np.ndarray, input_names: List[str], output_names: List[str], 
+                        model_id: str, metadata_names: List[str] = None) -> Tuple[Dict, Dict]:
+        """Convert filtered data back to KServe request/response format"""
+        try:
+            # Determine column indices for inputs and outputs
+            input_indices = []
+            output_indices = []
+            metadata_indices = []
+            
+            combined_names = input_names + output_names
+            if metadata_names:
+                combined_names += metadata_names
+            
+            for i, col_name in enumerate(combined_names):
+                if i < len(input_names):
+                    input_indices.append(i)
+                elif i < len(input_names) + len(output_names):
+                    output_indices.append(i)
+                else:
+                    metadata_indices.append(i)
+            
+            # Extract input and output data
+            input_data = filtered_data[:, input_indices]
+            output_data = filtered_data[:, output_indices]
+            
+            # Create KServe format
+            # Request
+            inputs = []
+            for i, name in enumerate(input_names):
+                kserve_input = KServeData(
+                    name=name,
+                    shape=[input_data.shape[0], 1],  # [rows, 1]
+                    datatype="FP32",
+                    data=input_data[:, i].tolist()
+                )
+                inputs.append(kserve_input.dict())
+            
+            # Response
+            outputs = []
+            for i, name in enumerate(output_names):
+                kserve_output = KServeData(
+                    name=name,
+                    shape=[output_data.shape[0], 1],  # [rows, 1]
+                    datatype="FP32",
+                    data=output_data[:, i].tolist()
+                )
+                outputs.append(kserve_output.dict())
+            
+            request = {
+                "id": f"{model_id}_request",
+                "inputs": inputs
+            }
+            
+            response = {
+                "id": f"{model_id}_response",
+                "model_name": model_id,
+                "outputs": outputs
+            }
+            
+            return request, response
+        except Exception as e:
+            logger.error(f"Error converting to KServe format: {str(e)}", exc_info=True)
+            return {}, {}
+
 @router.post("/download")
 async def download_data(payload: DataRequestPayload):
-    """Download model data with filtering options."""
+    """Download model data with filtering options and format selection."""
     try:
         model_id = payload.modelId
         logger.info(f"Processing data download request for model: {model_id}")
@@ -406,11 +487,22 @@ async def download_data(payload: DataRequestPayload):
             if result_rows:
                 filtered_data = np.array(result_rows)
         
-        # Convert to CSV 
-        csv_data = CSVConverter.numpy_to_csv(filtered_data, combined_names, True)
-        
-        # Return response
-        return DataResponsePayload(dataCSV=csv_data)
+        # Prepare response based on requested format
+        if payload.format == OutputFormat.CSV:
+            # Convert to CSV 
+            csv_data = CSVConverter.numpy_to_csv(filtered_data, combined_names, True)
+            return DataResponsePayload(dataCSV=csv_data)
+        elif payload.format == OutputFormat.KSERVE:
+            # Convert to KServe format
+            kserve_request, kserve_response = KServeConverter.numpy_to_kserve(
+                filtered_data, input_names, output_names, model_id, 
+                metadata_names if metadata_array.size > 0 else None
+            )
+            return DataResponsePayload(kserveRequest=kserve_request, kserveResponse=kserve_response)
+        else:
+            # Default to CSV if format is unrecognized
+            csv_data = CSVConverter.numpy_to_csv(filtered_data, combined_names, True)
+            return DataResponsePayload(dataCSV=csv_data)
         
     except ValueError as e:
         logger.error(f"Error in data download request: {str(e)}")

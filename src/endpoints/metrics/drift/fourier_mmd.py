@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 from src.service.metrics.drift.fourier_mmd.fourier_mmd import FourierMMD
 from src.service.metrics.drift.fourier_mmd.fourier_mmd_fitting import FourierMMDFitting
 from src.service.constants import INPUT_SUFFIX, METADATA_SUFFIX
@@ -8,6 +8,7 @@ from src.service.data.storage import get_storage_interface
 import logging
 import numpy as np
 import uuid
+import os
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -41,8 +42,20 @@ class FourierMMDMetricRequest(BaseModel):
     fitting: Optional[Dict[str, Any]] = None
 
 
+class MetricValueCarrier(BaseModel):
+    value: float
+    namedValues: Optional[Dict[str, float]] = None
+    description: Optional[str] = None
+
+
+class MetricThreshold(BaseModel):
+    min: float = 0.0
+    max: float
+    value: float
+
+
 @router.post("/metrics/drift/fouriermmd")
-async def compute_fouriermmd(request: FourierMMDMetricRequest):
+async def compute_fouriermmd(request: FourierMMDMetricRequest) -> Union[Dict[str, float], Dict[str, str]]:
     """Compute the FourierMMD metric."""
     try:
         model_id = request.modelId
@@ -81,21 +94,34 @@ async def compute_fouriermmd(request: FourierMMDMetricRequest):
         if len(metadata_data) == 0:
             return {"error": "No metadata found"}
             
-        sample_row = metadata_data[0]
-        logger.info(f"Sample metadata type: {type(sample_row)}")
-        
-        # Process all metadata rows
+        # Process all metadata rows to extract data tags
         for i in range(len(metadata_data)):
             try:
                 row = metadata_data[i]
                 metadata_dict = None
                 
+                # Handle different potential metadata formats
                 if isinstance(row, dict) and 'data_tag' in row:
-                    # Handle direct dictionary format
                     metadata_dict = row
+                elif isinstance(row, np.ndarray) and 'data_tag' in metadata_names:
+                    # If metadata is stored as a numpy array with named columns
+                    tag_idx = list(metadata_names).index('data_tag')
+                    metadata_dict = {'data_tag': row[tag_idx]}
+                elif isinstance(row, (bytes, np.void)) and hasattr(row, 'dtype') and 'metadata' in row.dtype.names:
+                    # Special handling for pickled metadata
+                    import pickle
+                    try:
+                        metadata_bytes = row['metadata']
+                        clean_bytes = metadata_bytes.rstrip(b'\x00') if isinstance(metadata_bytes, bytes) else metadata_bytes
+                        metadata_dict = pickle.loads(clean_bytes, encoding='latin1')
+                    except Exception as e:
+                        logger.warning(f"Failed to unpickle metadata: {e}")
                 else:
-                    # raise an error if the expected format is not found
-                    raise ValueError(f"Unexpected metadata format at row {i}")
+                    # Try alternate formats or read from the metadata column
+                    for col_idx, col_name in enumerate(metadata_names):
+                        if col_name == 'data_tag' and col_idx < len(row):
+                            metadata_dict = {'data_tag': row[col_idx]}
+                            break
         
                 if metadata_dict and 'data_tag' in metadata_dict:
                     tag = metadata_dict['data_tag']
@@ -123,7 +149,7 @@ async def compute_fouriermmd(request: FourierMMDMetricRequest):
                 return {"error": "No reference tag specified and no default reference data found"}
                 
         if not test_indices:
-            return {"error": "No test data found"}
+            return {"error": "No test data found (all data has the reference tag)"}
         
         # Extract reference and test data
         ref_data = input_data[ref_indices]
@@ -131,34 +157,42 @@ async def compute_fouriermmd(request: FourierMMDMetricRequest):
         
         logger.info(f"Reference data shape: {ref_data.shape}, Test data shape: {test_data.shape}")
         
+        # Check for sufficient test data
+        if len(test_indices) == 0:
+            logger.warning("Test data has no observations; FourierMMD results will not be numerically reliable.")
+            # Return a default result with 0.0 p-value similar to Java implementation
+            return {"value": 0.0}
+        
         # Get parameters from request
         params = request.parameters
-        delta_stat = params.deltaStat
-        n_test = params.nTest
-        n_window = params.nWindow
-        sig = params.sig
-        n_mode = params.nMode
-        epsilon = params.epsilon
         
         # Initialize FourierMMD
+        fourier_mmd_fitting = None
         if request.fitting:
-            # TODO: Implement loading from fitting data
-            logger.info("Using provided fitting data")
-            # This would require deserializing the fitting data
-            raise NotImplementedError("Loading from fitting data not yet implemented")
+            # Use provided fitting data
+            logger.info("Using previously found FourierMMD fitting in request")
+            fourier_mmd_fitting = FourierMMDFitting.from_dict(request.fitting)
         else:
-            logger.info("Computing FourierMMD fitting from reference data")
-            fourier_mmd = FourierMMD(
-                train_data=ref_data,
+            # Precompute fitting from reference data
+            logger.info("Fitting a FourierMMD drift request")
+            # Fixed parameter names to match the method signature
+            fourier_mmd_fitting = FourierMMD.precompute(
+                data=ref_data,  # Changed from train_data to data
                 column_names=input_names,
-                delta_stat=delta_stat,
-                n_test=n_test,
-                n_window=n_window,
-                sig=sig,
-                random_seed=42,
-                n_mode=n_mode,
-                epsilon=epsilon
+                delta_stat=params.deltaStat,
+                n_test=params.nTest,
+                n_window=params.nWindow,
+                sig=params.sig,
+                random_seed=0,  # Match Java's use of 0 as seed
+                n_mode=params.nMode,
+                epsilon=params.epsilon
             )
+            
+            # Store fitting in request for potential caching
+            request.fitting = fourier_mmd_fitting.to_dict()
+        
+        # Create FourierMMD with fitting
+        fourier_mmd = FourierMMD(fourier_mmd_fitting=fourier_mmd_fitting)
         
         # Calculate FourierMMD result
         threshold = request.thresholdDelta
@@ -175,7 +209,10 @@ async def compute_fouriermmd(request: FourierMMDMetricRequest):
         
         logger.info(f"FourierMMD result: p_value={p_value}, statistic={statistic}, drift_detected={is_drifted}")
         
-        # Return just the p-value as in the Java implementation
+        # Create a specific definition string similar to Java implementation
+        description = get_specific_definition(p_value, threshold)
+        
+        # Return p-value as in the Java implementation
         return {"value": float(p_value)}
         
     except Exception as e:
@@ -183,15 +220,29 @@ async def compute_fouriermmd(request: FourierMMDMetricRequest):
         raise HTTPException(status_code=500, detail=f"Error computing metric: {str(e)}")
 
 
+def get_specific_definition(p_value: float, threshold: float) -> str:
+    """Generate a specific definition for FourierMMD results similar to Java implementation."""
+    general_def = "FourierMMD gives probability that the data values seen in a test dataset have drifted from the training dataset distribution, under the assumption that the computed MMD values are normally distributed."
+    
+    is_drifted = p_value > threshold
+    result = [
+        general_def,
+        "",
+        f"  - Test data has p={p_value:.6f} probability of having drifted from the training distribution."
+    ]
+    
+    if is_drifted:
+        result[-1] += f" p > {threshold:.6f} -> [SIGNIFICANT DRIFT]"
+    else:
+        result[-1] += f" p <= {threshold:.6f}"
+    
+    return os.linesep.join(result)
+
+
 @router.get("/metrics/drift/fouriermmd/definition")
 async def get_fouriermmd_definition():
     """Provide a general definition of FourierMMD metric."""
-    return {
-        "name": "FourierMMD Drift Detection",
-        "description": "FourierMMD gives probability that the data values seen in a test dataset have drifted from the training dataset distribution, under the assumption that the computed MMD values are normally distributed.",
-        "interpretation": "High p-values (above the threshold) indicate significant drift in the distribution of values.",
-        "thresholdMeaning": "P-value threshold for significance testing. Values above this threshold indicate significant drift."
-    }
+    return "FourierMMD gives probability that the data values seen in a test dataset have drifted from the training dataset distribution, under the assumption that the computed MMD values are normally distributed."
 
 
 @router.post("/metrics/drift/fouriermmd/request")

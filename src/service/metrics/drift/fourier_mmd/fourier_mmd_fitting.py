@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Dict, Any
 import numpy as np
 
 class FourierMMDFitting:
@@ -83,3 +83,60 @@ class FourierMMDFitting:
         """String representation."""
         return (f"FourierMMDFitting{{randomSeed={self._random_seed}, "
                 f"deltaStat={self._delta_stat}, n_mode={self._n_mode}}}")
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert the FourierMMDFitting to a dictionary that can be serialized.
+        
+        Returns:
+            Dictionary representation of the fitting
+        """
+        result = {
+            "random_seed": self._random_seed,
+            "delta_stat": self._delta_stat,
+            "n_mode": self._n_mode,
+            "mean_mmd": self._mean_mmd,
+            "std_mmd": self._std_mmd
+        }
+        
+        # Convert numpy arrays to lists for serialization
+        if self._scale is not None:
+            result["scale"] = self._scale.tolist()
+        
+        if self._a_ref is not None:
+            result["a_ref"] = self._a_ref.tolist()
+            
+        return result
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'FourierMMDFitting':
+        """
+        Create a FourierMMDFitting instance from a dictionary.
+        
+        Args:
+            data: Dictionary containing the fitting data
+            
+        Returns:
+            A new FourierMMDFitting instance
+        """
+        instance = cls(
+            random_seed=data.get("random_seed"),
+            delta_stat=data.get("delta_stat"),
+            n_mode=data.get("n_mode")
+        )
+        
+        # Set mean and std
+        if "mean_mmd" in data:
+            instance.set_mean_mmd(data["mean_mmd"])
+        
+        if "std_mmd" in data:
+            instance.set_std_mmd(data["std_mmd"])
+        
+        # Convert lists back to numpy arrays
+        if "scale" in data:
+            instance.set_scale(np.array(data["scale"]))
+        
+        if "a_ref" in data:
+            instance.set_a_ref(np.array(data["a_ref"]))
+        
+        return instance

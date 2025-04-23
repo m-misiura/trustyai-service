@@ -1,4 +1,4 @@
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Dict, Any, Tuple, List, Optional, Callable
 import numpy as np
 import logging
 
@@ -83,3 +83,67 @@ class TensorParser:
             return np.hstack(formatted)
         except ValueError as e:
             raise ValueError(f"Failed to combine arrays: {str(e)}")
+    
+    @classmethod
+    def process_multiple_tensors(cls, tensors, contains_non_numeric_fn=None):
+        """Process multiple tensors, similar to the multi-tensor case in consumer_endpoint.py."""
+        data = []
+        shapes = set()
+        shape_tuples = []
+        column_names = []
+        
+        for tensor in tensors:
+            data.append(tensor.data)
+            shapes.add(tuple(tensor.shape))
+            column_names.append(tensor.name)
+            shape_tuples.append((tensor.name, tensor.shape))
+        
+        if len(shapes) == 1:
+            if contains_non_numeric_fn and contains_non_numeric_fn(data):
+                return np.array(data, dtype="O").T, column_names, shape_tuples
+            else:
+                return np.array(data).T, column_names, shape_tuples
+        
+        # Return shape_tuples to allow caller to handle mismatched shapes
+        return None, None, shape_tuples
+    
+    @classmethod
+    def process_single_tensor(cls, tensor, contains_non_numeric_fn=None):
+        """Process a single tensor, similar to the single tensor case in consumer_endpoint.py."""
+        column_names = []
+        
+        if len(tensor.shape) > 1:
+            column_names = [f"{tensor.name}-{i}" for i in range(tensor.shape[1])]
+        else:
+            column_names = [tensor.name]
+        
+        if contains_non_numeric_fn and contains_non_numeric_fn(tensor.data):
+            return np.array(tensor.data, dtype="O"), column_names
+        else:
+            return np.array(tensor.data), column_names
+    
+    @classmethod
+    def process_payload(cls, payload, get_data_fn: Callable, enforced_first_shape: int = None, contains_non_numeric_fn=None):
+        """Process payload in a way that matches consumer_endpoint.py's process_payload function."""
+        tensors = get_data_fn(payload)
+        
+        if len(tensors) > 1:  # multi tensor case
+            array, column_names, shape_tuples = cls.process_multiple_tensors(tensors, contains_non_numeric_fn)
+            
+            if array is None:  # Shapes mismatch, caller should handle error
+                return None, None, shape_tuples
+            
+            row_count = array.shape[0]
+            if enforced_first_shape is not None and row_count != enforced_first_shape:
+                # Return information for caller to handle row count mismatch
+                return None, None, None, enforced_first_shape, row_count
+            
+            return array, column_names, None
+        
+        else:  # single tensor case
+            tensor = tensors[0]
+            if enforced_first_shape is not None and tensor.shape[0] != enforced_first_shape:
+                # Return information for caller to handle row count mismatch
+                return None, None, None, enforced_first_shape, tensor.shape[0]
+            
+            return cls.process_single_tensor(tensor, contains_non_numeric_fn)

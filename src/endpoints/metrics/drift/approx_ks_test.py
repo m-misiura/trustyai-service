@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 from src.service.metrics.drift.ks_test.approx_ks_test import ApproxKSTest
 from src.service.metrics.drift.ks_test.approx_ks_fitting import ApproxKSFitting
 from src.service.constants import INPUT_SUFFIX, METADATA_SUFFIX
@@ -8,6 +8,7 @@ from src.service.data.storage import get_storage_interface
 import logging
 import numpy as np
 import uuid
+import os
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -24,20 +25,33 @@ class ApproxKSTestMetricRequest(BaseModel):
     requestName: Optional[str] = None
     metricName: Optional[str] = None
     batchSize: Optional[int] = 100
-    thresholdDelta: Optional[float] = None
+    thresholdDelta: Optional[float] = 0.05
     referenceTag: Optional[str] = None
     epsilon: float = Field(0.01, description="Maximum error for the approximate KS test")
     sketchFitting: Optional[Dict[str, Any]] = None
 
 
+class MetricValueCarrier(BaseModel):
+    namedValues: Dict[str, float]
+    description: Optional[str] = None
+
+
+class MetricThreshold(BaseModel):
+    min: float = 0.0
+    max: float
+    value: float
+
+
 @router.post("/metrics/drift/approxkstest")
-async def compute_approxkstest(request: ApproxKSTestMetricRequest):
+async def compute_approxkstest(request: ApproxKSTestMetricRequest) -> Union[Dict[str, float], Dict[str, str]]:
     """Compute the ApproxKSTest metric."""
     try:
         model_id = request.modelId
         reference_tag = request.referenceTag
         epsilon = request.epsilon
-        logger.info(f"Computing ApproxKSTest for model: {model_id}, reference tag: {reference_tag}, epsilon: {epsilon}")
+        threshold = request.thresholdDelta if request.thresholdDelta is not None else 0.05
+        
+        logger.info(f"Computing ApproxKSTest for model: {model_id}, reference tag: {reference_tag}, epsilon: {epsilon}, threshold: {threshold}")
         
         # Access datasets
         input_dataset = model_id + INPUT_SUFFIX
@@ -71,21 +85,34 @@ async def compute_approxkstest(request: ApproxKSTestMetricRequest):
         if len(metadata_data) == 0:
             return {"error": "No metadata found"}
             
-        sample_row = metadata_data[0]
-        logger.info(f"Sample metadata type: {type(sample_row)}")
-        
-        # Process all metadata rows
+        # Process all metadata rows to extract data tags
         for i in range(len(metadata_data)):
             try:
                 row = metadata_data[i]
                 metadata_dict = None
                 
+                # Handle different potential metadata formats
                 if isinstance(row, dict) and 'data_tag' in row:
-                    # Handle direct dictionary format
                     metadata_dict = row
+                elif isinstance(row, np.ndarray) and 'data_tag' in metadata_names:
+                    # If metadata is stored as a numpy array with named columns
+                    tag_idx = list(metadata_names).index('data_tag')
+                    metadata_dict = {'data_tag': row[tag_idx]}
+                elif isinstance(row, (bytes, np.void)) and hasattr(row, 'dtype') and 'metadata' in row.dtype.names:
+                    # Special handling for pickled metadata
+                    import pickle
+                    try:
+                        metadata_bytes = row['metadata']
+                        clean_bytes = metadata_bytes.rstrip(b'\x00') if isinstance(metadata_bytes, bytes) else metadata_bytes
+                        metadata_dict = pickle.loads(clean_bytes, encoding='latin1')
+                    except Exception as e:
+                        logger.warning(f"Failed to unpickle metadata: {e}")
                 else:
-                    # raise an error if the expected format is not found
-                    raise ValueError(f"Unexpected metadata format at row {i}")
+                    # Try alternate formats or read from the metadata column
+                    for col_idx, col_name in enumerate(metadata_names):
+                        if col_name == 'data_tag' and col_idx < len(row):
+                            metadata_dict = {'data_tag': row[col_idx]}
+                            break
         
                 if metadata_dict and 'data_tag' in metadata_dict:
                     tag = metadata_dict['data_tag']
@@ -113,7 +140,10 @@ async def compute_approxkstest(request: ApproxKSTestMetricRequest):
                 return {"error": "No reference tag specified and no default reference data found"}
                 
         if not test_indices:
-            return {"error": "No test data found"}
+            return {"error": "No test data found (all data has the reference tag)"}
+        
+        if len(test_indices) < 2:
+            logger.warning("Test data has less than two observations; ApproxKSTest results will not be numerically reliable.")
         
         # Extract reference and test data
         ref_data = input_data[ref_indices]
@@ -122,18 +152,22 @@ async def compute_approxkstest(request: ApproxKSTestMetricRequest):
         logger.info(f"Reference data shape: {ref_data.shape}, Test data shape: {test_data.shape}")
         
         # Initialize ApproxKSTest
+        approx_ks_fitting = None
         if request.sketchFitting:
             # Use provided sketches
             logger.info("Using provided sketch fitting")
             approx_ks_fitting = ApproxKSFitting(request.sketchFitting)
-            approx_ks = ApproxKSTest(eps=epsilon, approx_ks_fitting=approx_ks_fitting)
         else:
             # Precompute sketches from reference data
             logger.info("Computing sketch fitting from reference data")
-            approx_ks = ApproxKSTest(eps=epsilon, train_data=ref_data, column_names=input_names)
+            approx_ks_fitting = ApproxKSTest.precompute(ref_data, column_names=input_names, eps=epsilon)
+            # Store the fitting in the request for potential caching/reuse
+            request.sketchFitting = approx_ks_fitting.get_fit_sketches()
+        
+        # Create ApproxKSTest with the fitting
+        approx_ks = ApproxKSTest(eps=epsilon, approx_ks_fitting=approx_ks_fitting)
         
         # Calculate ApproxKSTest result
-        threshold = request.thresholdDelta or 0.05
         logger.info(f"Computing ApproxKSTest with threshold={threshold}")
         
         ks_test_results = approx_ks.calculate(
@@ -143,15 +177,51 @@ async def compute_approxkstest(request: ApproxKSTestMetricRequest):
         )
         
         # Format results - extract p-values for the response
-        namedValues = {}
+        named_values = {}
         for column_name, result in ks_test_results.items():
-            namedValues[column_name] = float(result.get_p_value())
-            
-        return namedValues
+            named_values[column_name] = float(result.get_p_value())
+        
+        # Create a more detailed description similar to the Java implementation
+        description = get_specific_definition(named_values, threshold, epsilon)
+        
+        # Check if any column exceeds the threshold
+        max_p_value = max(named_values.values()) if named_values else 0.0
+        threshold_result = {
+            "min": 0.0,
+            "max": threshold,
+            "value": max_p_value
+        }
+        
+        # We can either return just the p-values or a more detailed structure
+        return named_values
             
     except Exception as e:
         logger.error(f"Error computing ApproxKSTest: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error computing metric: {str(e)}")
+
+
+def get_specific_definition(named_values: Dict[str, float], threshold: float, epsilon: float) -> str:
+    """Generate a specific definition/description of the ApproxKSTest results."""
+    general_def = "ApproxKSTest calculates an approximate Kolmogorov-Smirnov test, and ensures that the maximum error is 6*epsilon as compared to an exact KS Test."
+    result = [general_def, ""]
+    
+    # Find the maximum column name length for formatting
+    max_col_len = max([len(col) for col in named_values.keys()]) if named_values else 0
+    
+    # Format each column's result
+    for col_name, p_value in named_values.items():
+        reject = p_value <= threshold
+        padding = " " * (max_col_len - len(col_name))
+        
+        line = f"  - Column {col_name}{padding} has p={p_value:.6f} probability of coming from the training distribution."
+        if reject:
+            line += f" p <= {threshold:.6f} -> [SIGNIFICANT DRIFT]"
+        else:
+            line += f" p > {threshold:.6f}"
+        
+        result.append(line)
+    
+    return os.linesep.join(result)
 
 
 @router.get("/metrics/drift/approxkstest/definition")

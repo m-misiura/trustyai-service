@@ -7,6 +7,7 @@ from src.service.data.storage import get_storage_interface
 import logging
 import numpy as np
 import uuid
+import os
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -117,6 +118,10 @@ async def compute_kstest(request: KSTestMetricRequest):
         
         logger.info(f"Reference data shape: {ref_data.shape}, Test data shape: {test_data.shape}")
         
+        # Check for sufficient test data
+        if len(test_indices) < 2:
+            logger.warning("Test data has less than two observations; KSTest results will not be numerically reliable.")
+        
         # Calculate KSTest
         kstest = KSTest()
         
@@ -134,7 +139,9 @@ async def compute_kstest(request: KSTestMetricRequest):
         namedValues = {}
         for column_name, result in ks_test_results.items():
             namedValues[column_name] = float(result.get_p_value())
-        return namedValues
+        
+        # Return in a format matching Java implementation
+        return {"namedValues": namedValues}
     
     except Exception as e:
         logger.error(f"Error computing KSTest: {str(e)}", exc_info=True)
@@ -150,6 +157,33 @@ async def get_kstest_definition():
         "interpretation": "Low p-values (below the threshold) indicate significant drift in the distribution of values.",
         "thresholdMeaning": "P-value threshold for significance testing. Lower values require stronger evidence of drift."
     }
+
+
+def get_specific_definition(namedValues: Dict[str, float], threshold: float) -> str:
+    """Generate a specific definition for KSTest results similar to Java implementation."""
+    general_def = "KSTest calculates two sample kolmogorov-smirnov test per column which tests if two samples drawn from the same distributions."
+    
+    out = [general_def, ""]
+    
+    # Find max column name length for formatting
+    max_col_len = max([len(col) for col in namedValues.keys()]) if namedValues else 0
+    fmt = f"%{max_col_len}s"
+    
+    # Add details for each column
+    for column_name, p_value in namedValues.items():
+        formatted_column = fmt % column_name
+        reject = p_value <= threshold
+        
+        line = f"  - Column {formatted_column} has p={p_value:.6f} probability of coming from the training distribution."
+        
+        if reject:
+            line += f" p <= {threshold:.6f} -> [SIGNIFICANT DRIFT]"
+        else:
+            line += f" p >  {threshold:.6f}"
+            
+        out.append(line)
+        
+    return os.linesep.join(out)
 
 
 @router.post("/metrics/drift/kstest/request")

@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, validator, Field
-from typing import Dict, Any, Tuple, List, Optional, Union
+from typing import Dict, Any, Tuple, List, Optional, Union, Literal, Callable
 import logging
 import numpy as np
 import uuid
@@ -9,10 +9,20 @@ import json
 import re
 import os
 import h5py
+import time
+from datetime import datetime
 
 from src.service.data.storage import get_storage_interface
 from src.service.constants import INPUT_SUFFIX, OUTPUT_SUFFIX, METADATA_SUFFIX
 from src.service.data.parsers import TensorParser
+from src.service.utils import list_utils
+
+# Import shared utilities to avoid duplication
+from src.endpoints.consumer.consumer_endpoint import (
+    KServeData, KServeInferenceRequest, KServeInferenceResponse,
+    reconcile_mismatching_shape_error, reconcile_mismatching_row_count_error,
+    process_payload
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -51,19 +61,25 @@ class ModelInferJointPayload(BaseModel):
             # Add any specific validation rules for data tags
         return v
 
-# --- Metadata Management ---
-
 class MetadataManager:
     """Handles creation and management of metadata"""
     
     @staticmethod
     async def create_metadata(sample_count: int, data_tag: Optional[str] = None) -> Tuple[List[Dict], List[str]]:
-        """Create metadata as a list of dictionaries."""
+        """Create metadata as a list of dictionaries with timestamp information."""
         metadata_list = []
+        
+        # Get current timestamp information (from consumer endpoint)
+        iso_time = datetime.isoformat(datetime.utcnow())
+        unix_timestamp = time.time()
         
         # Generate execution IDs
         for _ in range(sample_count):
-            item = {"execution_id": str(uuid.uuid4())}
+            item = {
+                "execution_id": str(uuid.uuid4()),
+                "iso_time": iso_time,
+                "unix_timestamp": unix_timestamp
+            }
             if data_tag:
                 item["data_tag"] = data_tag
             metadata_list.append(item)
@@ -180,8 +196,6 @@ class MetadataManager:
         logger.info(f"Writing {len(metadata_list)} pickled metadata items (protocol 0)")
         await storage_interface.write_data(dataset_name, metadata_array, ["metadata"])
 
-# --- Data Storage Handling ---
-
 class DataStorageHandler:
     """Handles storage operations for model data"""
     
@@ -282,8 +296,6 @@ class DataStorageHandler:
         except Exception as e:
             logger.error(f"Error handling metadata for {model_name}: {str(e)}", exc_info=True)
             raise
-
-# --- Ground Truth Handling ---
 
 class GroundTruthHandler:
     """Handles validation and processing of ground truth data"""
@@ -425,7 +437,6 @@ class GroundTruthHandler:
         
         return f"{len(ground_truth_metadata)} ground truths successfully added to {ground_truth_dataset}."
 
-# --- Main Service Class ---
 
 class DataUploadService:
     """Main service for handling data uploads"""
