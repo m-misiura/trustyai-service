@@ -184,12 +184,14 @@ class GroundTruthValidator:
         """Find row index for execution ID."""
         return self.id_to_row.get(str(exec_id))
 
-    def validate_data(
+    async def validate_data(
         self,
         exec_id: str,
         uploaded_inputs: List[Any],
         uploaded_outputs: List[Any],
         row_idx: int,
+        input_names: Optional[List[str]] = None,
+        output_names: Optional[List[str]] = None,
     ) -> Optional[str]:
         """Validate inputs and outputs."""
         if self.inputs is None or self.outputs is None:
@@ -212,6 +214,39 @@ class GroundTruthValidator:
             uploaded_type = get_type_name(uploaded)
             if existing_type != uploaded_type:
                 return f"ID={exec_id} output type mismatch at position {i + 1}: Class={existing_type} != Class={uploaded_type}"
+        if output_names:
+            try:
+                stored_output_names = await storage_interface.get_original_column_names(self.model_name + OUTPUT_SUFFIX)
+                if len(stored_output_names) != len(output_names):
+                    return (
+                        f"ID={exec_id} output name count mismatch. "
+                        f"Expected {len(stored_output_names)} names, "
+                        f"got {len(output_names)} names."
+                    )
+                for i, (stored_name, uploaded_name) in enumerate(zip(stored_output_names, output_names)):
+                    if stored_name != uploaded_name:
+                        return (
+                            f"ID={exec_id} output names do not match: "
+                            f"position {i + 1}: {stored_name} != {uploaded_name}"
+                        )
+            except Exception as e:
+                logger.warning(f"Could not validate output names for {exec_id}: {e}")
+        if input_names:
+            try:
+                stored_input_names = await storage_interface.get_original_column_names(self.model_name + INPUT_SUFFIX)
+                if len(stored_input_names) != len(input_names):
+                    return (
+                        f"ID={exec_id} input name count mismatch. "
+                        f"Expected {len(stored_input_names)} names, "
+                        f"got {len(input_names)} names."
+                    )
+                for i, (stored_name, uploaded_name) in enumerate(zip(stored_input_names, input_names)):
+                    if stored_name != uploaded_name:
+                        return (
+                            f"ID={exec_id} input names do not match: position {i + 1}: {stored_name} != {uploaded_name}"
+                        )
+            except Exception as e:
+                logger.warning(f"Could not validate input names for {exec_id}: {e}")
         return None
 
 
@@ -245,7 +280,7 @@ async def handle_ground_truths(
             continue
         uploaded_inputs = extract_row_data(input_arrays, i)
         uploaded_outputs = extract_row_data(output_arrays, i)
-        error = validator.validate_data(exec_id, uploaded_inputs, uploaded_outputs, row_idx)
+        error = await validator.validate_data(exec_id, uploaded_inputs, uploaded_outputs, row_idx)
         if error:
             errors.append(error)
             continue
