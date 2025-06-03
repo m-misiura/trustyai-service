@@ -249,7 +249,7 @@ def test_upload_data(n_input_rows, n_input_cols, n_output_cols, datatype):
     storage = get_storage_interface()
     print(f"Storage data_directory: {storage.data_directory}")
     print(f"Files in temp dir before: {os.listdir(TEMP_DIR) if os.path.exists(TEMP_DIR) else 'DIR_NOT_EXISTS'}")
-    
+ 
     response = post_test(payload, 200, [f"{n_input_rows} datapoints"])
     print(f"Files in temp dir after: {os.listdir(TEMP_DIR) if os.path.exists(TEMP_DIR) else 'DIR_NOT_EXISTS'}")
     print(f"Files in storage dir: {os.listdir(storage.data_directory) if os.path.exists(storage.data_directory) else 'STORAGE_DIR_NOT_EXISTS'}")
