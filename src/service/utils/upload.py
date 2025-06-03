@@ -170,6 +170,8 @@ class GroundTruthValidator:
 
     async def initialize(self) -> None:
         """Load existing data."""
+        # Get fresh storage interface for each call
+        storage_interface = get_storage_interface()
         self.inputs, _ = await storage_interface.read_data(self.model_name + INPUT_SUFFIX)
         self.outputs, _ = await storage_interface.read_data(self.model_name + OUTPUT_SUFFIX)
         self.metadata, _ = await storage_interface.read_data(self.model_name + METADATA_SUFFIX)
@@ -216,6 +218,8 @@ class GroundTruthValidator:
                 return f"ID={exec_id} output type mismatch at position {i + 1}: Class={existing_type} != Class={uploaded_type}"
         if output_names:
             try:
+                # Get fresh storage interface for each call
+                storage_interface = get_storage_interface()
                 stored_output_names = await storage_interface.get_original_column_names(self.model_name + OUTPUT_SUFFIX)
                 if len(stored_output_names) != len(output_names):
                     return (
@@ -233,6 +237,8 @@ class GroundTruthValidator:
                 logger.warning(f"Could not validate output names for {exec_id}: {e}")
         if input_names:
             try:
+                # Get fresh storage interface for each call
+                storage_interface = get_storage_interface()
                 stored_input_names = await storage_interface.get_original_column_names(self.model_name + INPUT_SUFFIX)
                 if len(stored_input_names) != len(input_names):
                     return (
@@ -262,6 +268,8 @@ async def handle_ground_truths(
     """Handle ground truth validation."""
     if not execution_ids:
         return GroundTruthValidationResult(success=False, message="No execution IDs provided.")
+    # Get fresh storage interface for each call
+    storage_interface = get_storage_interface()
     if not await storage_interface.dataset_exists(model_name + INPUT_SUFFIX):
         return GroundTruthValidationResult(success=False, message=f"Model {model_name} not found.")
     validator = GroundTruthValidator(model_name)
@@ -316,6 +324,8 @@ async def save_model_data(
     metadata_data: np.ndarray,
     metadata_names: List[str],
 ) -> Dict[str, Any]:
+    # Get fresh storage interface for each call
+    storage_interface = get_storage_interface()
     """Save model data to storage."""
     await storage_interface.write_data(model_name + INPUT_SUFFIX, input_data, input_names)
     await storage_interface.write_data(model_name + OUTPUT_SUFFIX, output_data, output_names)
