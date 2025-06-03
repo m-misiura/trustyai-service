@@ -240,7 +240,21 @@ def test_upload_data(n_input_rows, n_input_cols, n_output_cols, datatype):
     """Test uploading data with various dimensions and datatypes."""
     data_tag = "TRAINING"
     payload = generate_payload(n_input_rows, n_input_cols, n_output_cols, datatype, data_tag)
+    print(f"TEMP_DIR before upload: {TEMP_DIR}")
+    print(f"Files before upload: {os.listdir(TEMP_DIR) if os.path.exists(TEMP_DIR) else 'DIR_NOT_EXISTS'}")
+    
     response = post_test(payload, 200, [f"{n_input_rows} datapoints"])
+    print(f"Files after upload: {os.listdir(TEMP_DIR) if os.path.exists(TEMP_DIR) else 'DIR_NOT_EXISTS'}")
+    storage = get_storage_interface()
+    print(f"Storage data_directory: {storage.data_directory}")
+    print(f"Storage one_file_per_dataset: {storage.one_file_per_dataset}")
+    expected_input_file = storage._get_filename(payload["model_name"] + INPUT_SUFFIX)
+    expected_output_file = storage._get_filename(payload["model_name"] + OUTPUT_SUFFIX)
+    print(f"Expected input file: {expected_input_file}")
+    print(f"Expected output file: {expected_output_file}")
+    print(f"Input file exists: {os.path.exists(expected_input_file)}")
+    print(f"Output file exists: {os.path.exists(expected_output_file)}")
+    
     inputs = get_data_from_storage(payload["model_name"], INPUT_SUFFIX)
     outputs = get_data_from_storage(payload["model_name"], OUTPUT_SUFFIX)
     assert inputs is not None, "Input data not found in storage"
