@@ -6,7 +6,7 @@ import shutil
 import sys
 import tempfile
 import uuid
-import time
+
 import h5py
 import numpy as np
 import pytest
@@ -236,41 +236,13 @@ def post_test(payload, expected_status_code, check_msgs):
 @pytest.mark.parametrize("n_input_cols", [1, 4])
 @pytest.mark.parametrize("n_output_cols", [1, 2])
 @pytest.mark.parametrize("datatype", ["INT64", "INT32", "FP32", "FP64", "BOOL"])
-# @pytest.mark.parametrize("n_input_rows", [1])
-# @pytest.mark.parametrize("n_input_cols", [1])
-# @pytest.mark.parametrize("n_output_cols", [1])
-# @pytest.mark.parametrize("datatype", ["INT64"])
 def test_upload_data(n_input_rows, n_input_cols, n_output_cols, datatype):
     """Test uploading data with various dimensions and datatypes."""
     data_tag = "TRAINING"
     payload = generate_payload(n_input_rows, n_input_cols, n_output_cols, datatype, data_tag)
-    print(f"TEMP_DIR: {TEMP_DIR}")
-    print(f"STORAGE_DATA_FOLDER env: {os.environ.get('STORAGE_DATA_FOLDER')}")
-    storage = get_storage_interface()
-    print(f"Storage data_directory: {storage.data_directory}")
-    print(f"Files in temp dir before: {os.listdir(TEMP_DIR) if os.path.exists(TEMP_DIR) else 'DIR_NOT_EXISTS'}")
- 
     response = post_test(payload, 200, [f"{n_input_rows} datapoints"])
-    print(f"Files in temp dir after: {os.listdir(TEMP_DIR) if os.path.exists(TEMP_DIR) else 'DIR_NOT_EXISTS'}")
-    print(f"Files in storage dir: {os.listdir(storage.data_directory) if os.path.exists(storage.data_directory) else 'STORAGE_DIR_NOT_EXISTS'}")
-    if storage.data_directory != TEMP_DIR:
-        print(f"WARNING: Storage directory ({storage.data_directory}) != TEMP_DIR ({TEMP_DIR})")
-    
-    inputs = outputs = None
-    for attempt in range(10):  # Try for up to 1 second
-        inputs = get_data_from_storage(payload["model_name"], INPUT_SUFFIX)
-        outputs = get_data_from_storage(payload["model_name"], OUTPUT_SUFFIX)
-        if inputs is not None and outputs is not None:
-            break
-        print(f"Attempt {attempt + 1}: inputs={inputs is not None}, outputs={outputs is not None}")
-        time.sleep(0.1)
-    expected_input_file = storage._get_filename(payload["model_name"] + INPUT_SUFFIX)
-    expected_output_file = storage._get_filename(payload["model_name"] + OUTPUT_SUFFIX)
-    print(f"Expected input file: {expected_input_file}")
-    print(f"Expected output file: {expected_output_file}")
-    print(f"Input file exists: {os.path.exists(expected_input_file)}")
-    print(f"Output file exists: {os.path.exists(expected_output_file)}")
-    
+    inputs = get_data_from_storage(payload["model_name"], INPUT_SUFFIX)
+    outputs = get_data_from_storage(payload["model_name"], OUTPUT_SUFFIX)
     assert inputs is not None, "Input data not found in storage"
     assert outputs is not None, "Output data not found in storage"
     assert len(inputs["data"]) == n_input_rows, "Incorrect number of input rows"
