@@ -6,7 +6,8 @@ import shutil
 import sys
 import tempfile
 import uuid
-
+import asyncio
+import time
 import h5py
 import numpy as np
 import pytest
@@ -24,7 +25,14 @@ from src.service.constants import (
 )
 from src.service.data.storage import get_storage_interface
 
-
+@pytest.fixture(autouse=True) 
+def reset_storage():
+    """Reset storage interface for each test."""
+    import src.service.data.storage
+    src.service.data.storage._storage_interface = None
+    yield
+    
+    
 def pytest_sessionfinish(session, exitstatus):
     """Clean up the temporary directory after all tests are done."""
     if os.path.exists(TEMP_DIR):
@@ -244,6 +252,24 @@ def test_upload_data(n_input_rows, n_input_cols, n_output_cols, datatype):
     print(f"Files before upload: {os.listdir(TEMP_DIR) if os.path.exists(TEMP_DIR) else 'DIR_NOT_EXISTS'}")
     
     response = post_test(payload, 200, [f"{n_input_rows} datapoints"])
+    async def wait_for_storage():
+        """Wait for storage operations to complete."""
+        storage = get_storage_interface()
+        model_name = payload["model_name"]
+        
+        # Wait up to 3 seconds for files to be written
+        for attempt in range(30):
+            try:
+                # Try to read the data - if successful, files exist and are ready
+                inputs = await storage.read_data(model_name + INPUT_SUFFIX)
+                outputs = await storage.read_data(model_name + OUTPUT_SUFFIX)
+                if inputs[0] is not None and outputs[0] is not None:
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.1)
+        return False
+    
     print(f"Files after upload: {os.listdir(TEMP_DIR) if os.path.exists(TEMP_DIR) else 'DIR_NOT_EXISTS'}")
     storage = get_storage_interface()
     print(f"Storage data_directory: {storage.data_directory}")
@@ -254,6 +280,8 @@ def test_upload_data(n_input_rows, n_input_cols, n_output_cols, datatype):
     print(f"Expected output file: {expected_output_file}")
     print(f"Input file exists: {os.path.exists(expected_input_file)}")
     print(f"Output file exists: {os.path.exists(expected_output_file)}")
+    storage_ready = asyncio.run(wait_for_storage())
+    assert storage_ready, f"Storage operations did not complete for {payload['model_name']}"
     
     inputs = get_data_from_storage(payload["model_name"], INPUT_SUFFIX)
     outputs = get_data_from_storage(payload["model_name"], OUTPUT_SUFFIX)
