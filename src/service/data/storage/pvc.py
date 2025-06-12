@@ -207,22 +207,31 @@ class PVCStorage(StorageInterface):
                     dataset.attrs[BYTES_ATTRIBUTE] = is_bytes
 
     async def write_data(self, dataset_name: str, new_rows, column_names: List[str]):
-        """Write new data to a dataset, automatically serializing any non-numeric data"""
-        if isinstance(
-            new_rows, np.ndarray
-        ) and not list_utils.contains_non_numeric(new_rows):
-            await self._write_raw_data(dataset_name, new_rows, column_names)
-        elif (
-            isinstance(new_rows, np.ndarray)
-            and list_utils.contains_non_numeric(new_rows)
-            or not isinstance(new_rows, np.ndarray)
-            and list_utils.contains_non_numeric(new_rows)
-        ):
-            await self._write_raw_data(
-                dataset_name, list_utils.serialize_rows(new_rows), column_names
-            )
-        else:
+        """Write new data to a dataset. Properly structured numpy arrays are stored directly."""
+        
+        if isinstance(new_rows, np.ndarray):
+            # Handle the Unicode string array issue
+            if new_rows.dtype.kind == 'U':  # Unicode string array (metadata)
+                # Convert to list of lists, ensuring strings stay as Unicode
+                python_strings = new_rows.tolist()
+                # Create object array but specify string dtype for HDF5
+                str_array = np.array(python_strings, dtype='<U100')  # Fixed-length Unicode
+                await self._write_raw_data(dataset_name, str_array.astype('S'), column_names)
+            else:
+                # Numeric arrays - store directly
+                await self._write_raw_data(dataset_name, new_rows, column_names)
+        elif not list_utils.contains_non_numeric(new_rows):
+            # Pure numeric lists - convert to numpy array
             await self._write_raw_data(dataset_name, np.array(new_rows), column_names)
+        else:
+            # Mixed/unstructured data
+            raise ValueError(
+                f"Cannot store mixed or unstructured data in dataset '{dataset_name}'. "
+                f"Data must be either:\n"
+                f"  1. A properly structured numpy array (for numeric data)\n"
+                f"  2. A list of pure numeric values\n"
+                f"Current data contains mixed types and is not in a supported format."
+            )
 
     async def _read_raw_data(
         self, dataset_name: str, start_row: int = None, n_rows: int = None
@@ -247,14 +256,18 @@ class PVCStorage(StorageInterface):
                 )
 
     async def read_data(
-        self, dataset_name: str, start_row: int = None, n_rows: int = None
-    ) -> (np.ndarray, List[str]):
-        """Read data from a dataset, automatically deserializing any byte data"""
+    self, dataset_name: str, start_row: int = None, n_rows: int = None
+) -> (np.ndarray, List[str]):
+        """Read data from a dataset, converting byte strings back to Unicode."""
         read, column_names = await self._read_raw_data(dataset_name, start_row, n_rows)
-        if len(read) and read[0].dtype.type in {np.bytes_, np.void}:
-            return list_utils.deserialize_rows(read), column_names
-        else:
+        
+        if len(read) == 0:
             return read, column_names
+        # Handle byte string arrays (from new storage format) - convert back to Unicode
+        if read.dtype.kind == 'S':  # Byte string array
+            return read.astype('U'), column_names
+        # Numeric data - return as-is
+        return read, column_names
 
     async def delete_dataset(self, dataset_name: str):
         """Delete dataset data, ignoring non-existent datasets"""

@@ -35,9 +35,7 @@ def get_storage() -> Any:
     return get_storage_interface()
 
 
-def apply_matcher(
-    df: pd.DataFrame, matcher: RowMatcher, negate: bool = False
-) -> pd.DataFrame:
+def apply_matcher(df: pd.DataFrame, matcher: RowMatcher, negate: bool = False) -> pd.DataFrame:
     """Apply a single matcher to the dataframe."""
     if matcher.operation not in ["EQUALS", "BETWEEN"]:
         raise HTTPException(
@@ -50,9 +48,7 @@ def apply_matcher(
         return apply_between_matcher(df, matcher, negate)
 
 
-def apply_equals_matcher(
-    df: pd.DataFrame, matcher: RowMatcher, negate: bool = False
-) -> pd.DataFrame:
+def apply_equals_matcher(df: pd.DataFrame, matcher: RowMatcher, negate: bool = False) -> pd.DataFrame:
     """Apply EQUALS matcher to dataframe."""
     column_name = matcher.columnName
     values = matcher.values
@@ -67,9 +63,7 @@ def apply_equals_matcher(
     return df[mask]
 
 
-def apply_between_matcher(
-    df: pd.DataFrame, matcher: RowMatcher, negate: bool = False
-) -> pd.DataFrame:
+def apply_between_matcher(df: pd.DataFrame, matcher: RowMatcher, negate: bool = False) -> pd.DataFrame:
     """Apply BETWEEN matcher to dataframe."""
     column_name = matcher.columnName
     values = matcher.values
@@ -105,9 +99,7 @@ def apply_between_matcher(
         min_val, max_val = sorted([int(v) for v in values])
         mask = (df[column_name] >= min_val) & (df[column_name] < max_val)
     else:
-        if not all(
-            isinstance(v, numbers.Number) and not isinstance(v, bool) for v in values
-        ):
+        if not all(isinstance(v, numbers.Number) and not isinstance(v, bool) for v in values):
             errors.append(
                 "BETWEEN operation must only contain numbers, describing the lower and upper bounds of the desired range. Received non-numeric values"
             )
@@ -117,7 +109,6 @@ def apply_between_matcher(
         min_val, max_val = sorted(values)
         # try to convert column to numeric if it is not already
         numeric_column = pd.to_numeric(df[column_name], errors="coerce")
-
         # check if conversion was successful
         if numeric_column.isna().any():
             # Some values couldn't be converted to numeric
@@ -145,61 +136,38 @@ async def load_model_dataframe(model_id: str) -> pd.DataFrame:
         input_data, input_cols = await storage.read_data(f"{model_id}_inputs")
         output_data, output_cols = await storage.read_data(f"{model_id}_outputs")
         metadata_data, metadata_cols = await storage.read_data(f"{model_id}_metadata")
+        logger.info(f"Input data shape: {input_data.shape if hasattr(input_data, 'shape') else 'No shape'}")
+        logger.info(f"Input columns: {input_cols}")
+        logger.info(f"Output data shape: {output_data.shape if hasattr(output_data, 'shape') else 'No shape'}")
+        logger.info(f"Output columns: {output_cols}")
+        logger.info(f"Metadata data shape: {metadata_data.shape if hasattr(metadata_data, 'shape') else 'No shape'}")
+        logger.info(f"Metadata columns: {metadata_cols}")
         if input_data is None or output_data is None or metadata_data is None:
             raise HTTPException(status_code=404, detail=f"Model {model_id} not found")
-        df = pd.DataFrame()
-        if len(input_data) > 0:
-            if (
-                input_data.ndim == 2
-                and len(input_cols) == 1
-                and input_data.shape[1] > 1
-            ):
-                col_name = input_cols[0]
-                for j in range(input_data.shape[1]):
-                    df[f"{col_name}_{j}"] = input_data[:, j]
-            else:
-                input_df = pd.DataFrame(input_data, columns=input_cols)
-                for col in input_cols:
-                    df[col] = input_df[col]
-        if len(output_data) > 0:
-            if (
-                output_data.ndim == 2
-                and len(output_cols) == 1
-                and output_data.shape[1] > 1
-            ):
-                col_name = output_cols[0]
-                for j in range(output_data.shape[1]):
-                    df[f"{col_name}_{j}"] = output_data[:, j]
-            else:
-                if output_data.ndim == 2:
-                    output_data = output_data.flatten()
-                output_df = pd.DataFrame({output_cols[0]: output_data})
-                for col in output_cols:
-                    df[col] = output_df[col]
-        if len(metadata_data) > 0 and isinstance(metadata_data[0], bytes):
-            deserialized_metadata = []
-            for row in metadata_data:
-                deserialized_row = pickle.loads(row)
-                deserialized_metadata.append(deserialized_row)
-            metadata_df = pd.DataFrame(deserialized_metadata, columns=metadata_cols)
-        else:
-            metadata_df = pd.DataFrame(metadata_data, columns=metadata_cols)
-        trusty_mapping = {
+        # Handle the case where input_data has multiple columns but single column name
+        if hasattr(input_data, "shape") and len(input_data.shape) > 1:
+            data_cols = input_data.shape[1]
+            if len(input_cols) == 1 and data_cols > 1:
+                # Expand single column name to match data columns
+                base_name = input_cols[0]
+                input_cols = [f"{base_name}_{i}" for i in range(data_cols)]
+                logger.info(f"Expanded input columns to: {input_cols}")
+        # Create DataFrames
+        input_df = pd.DataFrame(input_data, columns=input_cols)
+        output_df = pd.DataFrame(output_data, columns=output_cols)
+        metadata_df = pd.DataFrame(metadata_data, columns=metadata_cols)
+        # Map metadata columns to trustyai.* format (like Java does)
+        metadata_column_mapping = {
             "id": "trustyai.ID",
             "model_id": "trustyai.MODEL_ID",
             "timestamp": "trustyai.TIMESTAMP",
             "tag": "trustyai.TAG",
         }
-        for orig_col in metadata_cols:
-            trusty_col = trusty_mapping.get(orig_col.lower(), orig_col)
-            df[trusty_col] = metadata_df[orig_col]
-        df["trustyai.INDEX"] = range(len(df))
-        return df
+        metadata_df = metadata_df.rename(columns=metadata_column_mapping)
+        combined_df = pd.concat([metadata_df, input_df, output_df], axis=1)
+        combined_df["trustyai.INDEX"] = combined_df.index
+        return combined_df
+
     except Exception as e:
-        if "not found" in str(e).lower() or "MissingH5PYDataException" in str(
-            type(e).__name__
-        ):
-            raise HTTPException(status_code=404, detail=f"Model {model_id} not found")
-        raise HTTPException(
-            status_code=500, detail=f"Error loading model data: {str(e)}"
-        )
+        logger.error(f"Error loading model data: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error loading model data: {str(e)}")

@@ -6,6 +6,7 @@ import shutil
 import sys
 import tempfile
 import uuid
+import asyncio
 
 import h5py
 import numpy as np
@@ -141,82 +142,49 @@ def get_data_from_storage(model_name, suffix):
 
 
 def get_metadata_ids(model_name):
-    """Extract actual IDs from metadata storage."""
-    storage = get_storage_interface()
-    filename = storage._get_filename(model_name + METADATA_SUFFIX)
-    if not os.path.exists(filename):
-        return []
-    ids = []
-    with h5py.File(filename, "r") as f:
-        if model_name + METADATA_SUFFIX in f:
-            metadata = f[model_name + METADATA_SUFFIX][:]
-            column_names = f[model_name + METADATA_SUFFIX].attrs.get("column_names", [])
+    """Extract actual IDs from metadata storage using storage interface."""
+    async def _get_ids():
+        try:
+            storage = get_storage_interface()
+            metadata_data, column_names = await storage.read_data(model_name + METADATA_SUFFIX)
             id_idx = next((i for i, name in enumerate(column_names) if name.lower() == "id"), None)
-            if id_idx is not None:
-                for row in metadata:
-                    try:
-                        if hasattr(row, "__getitem__") and len(row) > id_idx:
-                            id_val = row[id_idx]
-                        else:
-                            row_data = pickle.loads(row.tobytes())
-                            id_val = row_data[id_idx]
-                        if isinstance(id_val, np.ndarray):
-                            ids.append(str(id_val))
-                        else:
-                            ids.append(str(id_val))
-                    except Exception as e:
-                        print(f"Error processing ID from row {len(ids)}: {e}")
-                        continue
-    print(f"Successfully extracted {len(ids)} IDs: {ids}")
-    return ids
-
+            if id_idx is not None and len(metadata_data) > 0:
+                return [str(row[id_idx]) for row in metadata_data]
+        except Exception as e:
+            print(f"Error getting metadata IDs: {e}")
+        return []
+    
+    return asyncio.run(_get_ids())
 
 def get_metadata_from_storage(model_name):
-    """Get metadata directly from storage file."""
-    storage = get_storage_interface()
-    filename = storage._get_filename(model_name + METADATA_SUFFIX)
-    if not os.path.exists(filename):
+    """Get metadata using storage interface."""
+    async def _get_metadata():
+        try:
+            storage = get_storage_interface()
+            metadata_data, column_names = await storage.read_data(model_name + METADATA_SUFFIX)
+            if len(metadata_data) > 0:
+                # Convert to list of lists (clean strings from storage interface)
+                return {"data": [list(row) for row in metadata_data], "column_names": column_names}
+        except Exception as e:
+            print(f"Error getting metadata: {e}")
         return {"data": [], "column_names": []}
-    with h5py.File(filename, "r") as f:
-        if model_name + METADATA_SUFFIX in f:
-            metadata = f[model_name + METADATA_SUFFIX][:]
-            column_names = f[model_name + METADATA_SUFFIX].attrs.get("column_names", [])
-            parsed_rows = []
-            for row in metadata:
-                try:
-                    row_data = pickle.loads(row.tobytes())
-                    parsed_rows.append(row_data)
-                except Exception as e:
-                    print(f"Error unpickling metadata row: {e}")
-
-            return {"data": parsed_rows, "column_names": column_names}
-    return {"data": [], "column_names": []}
-
+    
+    return asyncio.run(_get_metadata())
 
 def count_rows_with_tag(model_name, tag):
-    """Count rows with a specific tag in metadata."""
-    storage = get_storage_interface()
-    filename = storage._get_filename(model_name + METADATA_SUFFIX)
-    if not os.path.exists(filename):
+    """Count rows with a specific tag using storage interface."""
+    async def _count_tags():
+        try:
+            storage = get_storage_interface()
+            metadata_data, column_names = await storage.read_data(model_name + METADATA_SUFFIX)
+            tag_idx = next((i for i, name in enumerate(column_names) if name.lower() == "tag"), None)
+            if tag_idx is not None and len(metadata_data) > 0:
+                return sum(1 for row in metadata_data if str(row[tag_idx]) == tag)
+        except Exception as e:
+            print(f"Error counting tags: {e}")
         return 0
-    count = 0
-    with h5py.File(filename, "r") as f:
-        if model_name + METADATA_SUFFIX in f:
-            metadata = f[model_name + METADATA_SUFFIX][:]
-            column_names = f[model_name + METADATA_SUFFIX].attrs.get("column_names", [])
-            tag_idx = next(
-                (i for i, name in enumerate(column_names) if name.lower() == "tag"),
-                None,
-            )
-            if tag_idx is not None:
-                for row in metadata:
-                    try:
-                        row_data = pickle.loads(row.tobytes())
-                        if tag_idx < len(row_data) and row_data[tag_idx] == tag:
-                            count += 1
-                    except Exception as e:
-                        print(f"Error unpickling tag: {e}")
-    return count
+    
+    return asyncio.run(_count_tags())
 
 
 def post_test(payload, expected_status_code, check_msgs):
