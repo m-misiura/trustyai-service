@@ -1,11 +1,12 @@
 import logging
+import numbers
 import pickle
 from datetime import datetime
 from typing import Any, List, Optional
 
 import pandas as pd
 from fastapi import HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.service.data.storage import get_storage_interface
 
@@ -20,9 +21,9 @@ class RowMatcher(BaseModel):
 
 class DataRequestPayload(BaseModel):
     modelId: str
-    matchAny: Optional[List[RowMatcher]] = []
-    matchAll: Optional[List[RowMatcher]] = []
-    matchNone: Optional[List[RowMatcher]] = []
+    matchAny: Optional[List[RowMatcher]] = Field(default_factory=list)
+    matchAll: Optional[List[RowMatcher]] = Field(default_factory=list)
+    matchNone: Optional[List[RowMatcher]] = Field(default_factory=list)
 
 
 class DataResponsePayload(BaseModel):
@@ -34,7 +35,9 @@ def get_storage() -> Any:
     return get_storage_interface()
 
 
-def apply_matcher(df: pd.DataFrame, matcher: RowMatcher, negate: bool = False) -> pd.DataFrame:
+def apply_matcher(
+    df: pd.DataFrame, matcher: RowMatcher, negate: bool = False
+) -> pd.DataFrame:
     """Apply a single matcher to the dataframe."""
     if matcher.operation not in ["EQUALS", "BETWEEN"]:
         raise HTTPException(
@@ -47,7 +50,9 @@ def apply_matcher(df: pd.DataFrame, matcher: RowMatcher, negate: bool = False) -
         return apply_between_matcher(df, matcher, negate)
 
 
-def apply_equals_matcher(df: pd.DataFrame, matcher: RowMatcher, negate: bool = False) -> pd.DataFrame:
+def apply_equals_matcher(
+    df: pd.DataFrame, matcher: RowMatcher, negate: bool = False
+) -> pd.DataFrame:
     """Apply EQUALS matcher to dataframe."""
     column_name = matcher.columnName
     values = matcher.values
@@ -62,7 +67,9 @@ def apply_equals_matcher(df: pd.DataFrame, matcher: RowMatcher, negate: bool = F
     return df[mask]
 
 
-def apply_between_matcher(df: pd.DataFrame, matcher: RowMatcher, negate: bool = False) -> pd.DataFrame:
+def apply_between_matcher(
+    df: pd.DataFrame, matcher: RowMatcher, negate: bool = False
+) -> pd.DataFrame:
     """Apply BETWEEN matcher to dataframe."""
     column_name = matcher.columnName
     values = matcher.values
@@ -98,7 +105,9 @@ def apply_between_matcher(df: pd.DataFrame, matcher: RowMatcher, negate: bool = 
         min_val, max_val = sorted([int(v) for v in values])
         mask = (df[column_name] >= min_val) & (df[column_name] < max_val)
     else:
-        if not all(isinstance(v, (int, float)) for v in values):
+        if not all(
+            isinstance(v, numbers.Number) and not isinstance(v, bool) for v in values
+        ):
             errors.append(
                 "BETWEEN operation must only contain numbers, describing the lower and upper bounds of the desired range. Received non-numeric values"
             )
@@ -106,12 +115,24 @@ def apply_between_matcher(df: pd.DataFrame, matcher: RowMatcher, negate: bool = 
             combined_error = ", ".join(errors)
             raise HTTPException(status_code=400, detail=combined_error)
         min_val, max_val = sorted(values)
-        try:
-            mask = (pd.to_numeric(df[column_name], errors="coerce") >= min_val) & (
-                pd.to_numeric(df[column_name], errors="coerce") < max_val
+        # try to convert column to numeric if it is not already
+        numeric_column = pd.to_numeric(df[column_name], errors="coerce")
+
+        # check if conversion was successful
+        if numeric_column.isna().any():
+            # Some values couldn't be converted to numeric
+            unique_non_numeric = df[column_name][numeric_column.isna()].unique()
+            total_count = len(unique_non_numeric)
+            examples = list(unique_non_numeric[:5])
+
+            raise HTTPException(
+                status_code=400,
+                detail=f"BETWEEN operation requires numeric column data, but column '{column_name}' contains {total_count} different non-numeric values. Examples: {examples}",
             )
-        except:
-            mask = (df[column_name].astype(str) >= str(min_val)) & (df[column_name].astype(str) < str(max_val))
+
+        # All values are numeric, proceed with comparison
+        mask = (numeric_column >= min_val) & (numeric_column < max_val)
+
     if negate:
         mask = ~mask
     return df[mask]
@@ -128,7 +149,11 @@ async def load_model_dataframe(model_id: str) -> pd.DataFrame:
             raise HTTPException(status_code=404, detail=f"Model {model_id} not found")
         df = pd.DataFrame()
         if len(input_data) > 0:
-            if input_data.ndim == 2 and len(input_cols) == 1 and input_data.shape[1] > 1:
+            if (
+                input_data.ndim == 2
+                and len(input_cols) == 1
+                and input_data.shape[1] > 1
+            ):
                 col_name = input_cols[0]
                 for j in range(input_data.shape[1]):
                     df[f"{col_name}_{j}"] = input_data[:, j]
@@ -137,7 +162,11 @@ async def load_model_dataframe(model_id: str) -> pd.DataFrame:
                 for col in input_cols:
                     df[col] = input_df[col]
         if len(output_data) > 0:
-            if output_data.ndim == 2 and len(output_cols) == 1 and output_data.shape[1] > 1:
+            if (
+                output_data.ndim == 2
+                and len(output_cols) == 1
+                and output_data.shape[1] > 1
+            ):
                 col_name = output_cols[0]
                 for j in range(output_data.shape[1]):
                     df[f"{col_name}_{j}"] = output_data[:, j]
@@ -167,6 +196,10 @@ async def load_model_dataframe(model_id: str) -> pd.DataFrame:
         df["trustyai.INDEX"] = range(len(df))
         return df
     except Exception as e:
-        if "not found" in str(e).lower() or "MissingH5PYDataException" in str(type(e).__name__):
+        if "not found" in str(e).lower() or "MissingH5PYDataException" in str(
+            type(e).__name__
+        ):
             raise HTTPException(status_code=404, detail=f"Model {model_id} not found")
-        raise HTTPException(status_code=500, detail=f"Error loading model data: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Error loading model data: {str(e)}"
+        )
