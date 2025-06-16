@@ -1,9 +1,18 @@
+"""
+Data upload utilities for TrustyAI service.
+
+This module provides optimized data processing and validation for model data uploads,
+including both regular data ingestion and ground truth handling.
+"""
+
 import logging
+import uuid
+from datetime import datetime
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+from fastapi import HTTPException
 
 from src.service.constants import (
     INPUT_SUFFIX,
@@ -11,13 +20,141 @@ from src.service.constants import (
     OUTPUT_SUFFIX,
     TRUSTYAI_TAG_PREFIX,
 )
+from src.service.data.modelmesh_parser import ModelMeshPayloadParser
 from src.service.data.storage import get_storage_interface
 
 logger = logging.getLogger(__name__)
-storage_interface = get_storage_interface()
 
 
-# Exceptions
+async def process_upload_request(payload: Any) -> Dict[str, str]:
+    """
+    Process complete upload request with validation and data handling.
+    """
+    model_name = ModelMeshPayloadParser.standardize_model_id(payload.model_name)
+    if payload.data_tag:
+        error = validate_data_tag(payload.data_tag)
+        if error:
+            raise HTTPException(400, error)
+    inputs = payload.request.get("inputs", [])
+    outputs = payload.response.get("outputs", [])
+    if not inputs or not outputs:
+        raise HTTPException(400, "Missing input or output tensors")
+    input_arrays, input_names, _, execution_ids = process_tensors(inputs)
+    output_arrays, output_names, _, _ = process_tensors(outputs)
+    error = validate_input_shapes(input_arrays, input_names)
+    if error:
+        raise HTTPException(400, f"One or more errors in input tensors: {error}")
+    if payload.is_ground_truth:
+        return await _process_ground_truth_data(
+            model_name, input_arrays, input_names, output_arrays, output_names, execution_ids
+        )
+    else:
+        return await _process_regular_data(
+            model_name, input_arrays, input_names, output_arrays, output_names, execution_ids, payload.data_tag
+        )
+
+
+async def _process_ground_truth_data(
+    model_name: str,
+    input_arrays: List[np.ndarray],
+    input_names: List[str],
+    output_arrays: List[np.ndarray],
+    output_names: List[str],
+    execution_ids: Optional[List[str]],
+) -> Dict[str, str]:
+    """Process ground truth data upload."""
+    if not execution_ids:
+        raise HTTPException(400, "Ground truth requires execution IDs")
+    result = await handle_ground_truths(
+        model_name,
+        input_arrays,
+        input_names,
+        output_arrays,
+        output_names,
+        [sanitize_id(id) for id in execution_ids],
+    )
+    if not result.success:
+        raise HTTPException(400, result.message)
+    result_data = result.data
+    if result_data is None:
+        raise HTTPException(500, "Ground truth processing failed")
+    gt_name = f"{model_name}_ground_truth"
+    storage_interface = get_storage_interface()
+    await storage_interface.write_data(gt_name + OUTPUT_SUFFIX, result_data["outputs"], result_data["output_names"])
+    await storage_interface.write_data(
+        gt_name + METADATA_SUFFIX,
+        result_data["metadata"],
+        result_data["metadata_names"],
+    )
+    logger.info(f"Ground truth data saved for model: {model_name}")
+    return {"message": result.message}
+
+
+async def _process_regular_data(
+    model_name: str,
+    input_arrays: List[np.ndarray],
+    input_names: List[str],
+    output_arrays: List[np.ndarray],
+    output_names: List[str],
+    execution_ids: Optional[List[str]],
+    data_tag: Optional[str],
+) -> Dict[str, str]:
+    """Process regular model data upload."""
+    n_rows = input_arrays[0].shape[0]
+    exec_ids = execution_ids or [str(uuid.uuid4()) for _ in range(n_rows)]
+    input_data = _flatten_tensor_data(input_arrays, n_rows)
+    output_data = _flatten_tensor_data(output_arrays, n_rows)
+    metadata, metadata_cols = _create_metadata(exec_ids, model_name, data_tag)
+    await save_model_data(
+        model_name,
+        np.array(input_data),
+        input_names,
+        np.array(output_data),
+        output_names,
+        metadata,
+        metadata_cols,
+    )
+    logger.info(f"Regular data saved for model: {model_name}, rows: {n_rows}")
+    return {"message": f"{n_rows} datapoints added to {model_name}"}
+
+
+def _flatten_tensor_data(arrays: List[np.ndarray], n_rows: int) -> List[List[Any]]:
+    """
+    Flatten tensor arrays into row-based format for storage.
+    """
+
+    def flatten_row(arrays: List[np.ndarray], row: int) -> List[Any]:
+        """Flatten arrays for a single row."""
+        return [x for arr in arrays for x in (arr[row].flatten() if arr.ndim > 1 else [arr[row]])]
+
+    return [flatten_row(arrays, i) for i in range(n_rows)]
+
+
+def _create_metadata(
+    execution_ids: List[str], model_name: str, data_tag: Optional[str]
+) -> Tuple[np.ndarray, List[str]]:
+    """
+    Create metadata array for model data storage.
+    """
+    current_timestamp = datetime.now().isoformat()
+
+    # FIX: Use UPPERCASE column names to match download.py expectations
+    metadata_cols = ["ID", "MODEL_ID", "TIMESTAMP", "TAG"]  # ← Changed to uppercase
+
+    metadata_rows = [
+        [
+            str(eid),
+            str(model_name),
+            str(current_timestamp),
+            str(data_tag or ""),
+        ]
+        for eid in execution_ids
+    ]
+
+    metadata = np.array(metadata_rows, dtype="<U100")
+    return metadata, metadata_cols
+
+
 class ValidationError(Exception):
     """Validation errors."""
 
@@ -30,7 +167,6 @@ class ProcessingError(Exception):
     pass
 
 
-# Data Models
 @dataclass
 class GroundTruthValidationResult:
     """Result of ground truth validation."""
@@ -41,7 +177,6 @@ class GroundTruthValidationResult:
     errors: List[str] = field(default_factory=list)
 
 
-# type mappings
 DTYPE_MAP = {
     "INT64": np.int64,
     "INT32": np.int32,
@@ -62,10 +197,7 @@ TYPE_MAP = {
 }
 
 
-# Utility Functions
-def get_numpy_dtype(
-    datatype: str,
-) -> Optional[np.dtype[Any]]:
+def get_numpy_dtype(datatype: str) -> Optional[np.dtype[Any]]:
     """Get numpy dtype from string."""
     dtype_class = DTYPE_MAP.get(datatype)
     return np.dtype(dtype_class) if dtype_class else None
@@ -170,13 +302,12 @@ class GroundTruthValidator:
 
     async def initialize(self) -> None:
         """Load existing data."""
-        # Get fresh storage interface for each call
         storage_interface = get_storage_interface()
         self.inputs, _ = await storage_interface.read_data(self.model_name + INPUT_SUFFIX)
         self.outputs, _ = await storage_interface.read_data(self.model_name + OUTPUT_SUFFIX)
         self.metadata, _ = await storage_interface.read_data(self.model_name + METADATA_SUFFIX)
         metadata_cols = await storage_interface.get_original_column_names(self.model_name + METADATA_SUFFIX)
-        id_col = next((i for i, name in enumerate(metadata_cols) if name.lower() == "id"), 0)
+        id_col = next((i for i, name in enumerate(metadata_cols) if name.upper() == "ID"), 0)
         if self.metadata is not None:
             for j, row in enumerate(self.metadata):
                 id_val = row[id_col]
@@ -218,7 +349,6 @@ class GroundTruthValidator:
                 return f"ID={exec_id} output type mismatch at position {i + 1}: Class={existing_type} != Class={uploaded_type}"
         if output_names:
             try:
-                # Get fresh storage interface for each call
                 storage_interface = get_storage_interface()
                 stored_output_names = await storage_interface.get_original_column_names(self.model_name + OUTPUT_SUFFIX)
                 if len(stored_output_names) != len(output_names):
@@ -237,7 +367,6 @@ class GroundTruthValidator:
                 logger.warning(f"Could not validate output names for {exec_id}: {e}")
         if input_names:
             try:
-                # Get fresh storage interface for each call
                 storage_interface = get_storage_interface()
                 stored_input_names = await storage_interface.get_original_column_names(self.model_name + INPUT_SUFFIX)
                 if len(stored_input_names) != len(input_names):
@@ -268,7 +397,6 @@ async def handle_ground_truths(
     """Handle ground truth validation."""
     if not execution_ids:
         return GroundTruthValidationResult(success=False, message="No execution IDs provided.")
-    # Get fresh storage interface for each call
     storage_interface = get_storage_interface()
     if not await storage_interface.dataset_exists(model_name + INPUT_SUFFIX):
         return GroundTruthValidationResult(success=False, message=f"Model {model_name} not found.")
@@ -310,7 +438,7 @@ async def handle_ground_truths(
             "outputs": np.array(valid_outputs),
             "output_names": output_names,
             "metadata": np.array(valid_metadata),
-            "metadata_names": ["id"],
+            "metadata_names": ["ID"],  # Note: lowercase here for ground truth metadata
         },
     )
 
@@ -324,12 +452,12 @@ async def save_model_data(
     metadata_data: np.ndarray,
     metadata_names: List[str],
 ) -> Dict[str, Any]:
-    # Get fresh storage interface for each call
-    storage_interface = get_storage_interface()
     """Save model data to storage."""
+    storage_interface = get_storage_interface()
     await storage_interface.write_data(model_name + INPUT_SUFFIX, input_data, input_names)
     await storage_interface.write_data(model_name + OUTPUT_SUFFIX, output_data, output_names)
     await storage_interface.write_data(model_name + METADATA_SUFFIX, metadata_data, metadata_names)
+    logger.info(f"Saved model data for {model_name}: {len(input_data)} rows")
     return {
         "model_name": model_name,
         "rows": len(input_data),
