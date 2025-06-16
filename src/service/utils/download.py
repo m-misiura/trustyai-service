@@ -1,11 +1,12 @@
 import logging
+import numbers
 import pickle
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Any, List
 
 import pandas as pd
 from fastapi import HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.service.data.storage import get_storage_interface
 
@@ -20,9 +21,9 @@ class RowMatcher(BaseModel):
 
 class DataRequestPayload(BaseModel):
     modelId: str
-    matchAny: Optional[List[RowMatcher]] = []
-    matchAll: Optional[List[RowMatcher]] = []
-    matchNone: Optional[List[RowMatcher]] = []
+    matchAny: List[RowMatcher] = Field(default_factory=list)
+    matchAll: List[RowMatcher] = Field(default_factory=list)
+    matchNone: List[RowMatcher] = Field(default_factory=list)
 
 
 class DataResponsePayload(BaseModel):
@@ -98,7 +99,7 @@ def apply_between_matcher(df: pd.DataFrame, matcher: RowMatcher, negate: bool = 
         min_val, max_val = sorted([int(v) for v in values])
         mask = (df[column_name] >= min_val) & (df[column_name] < max_val)
     else:
-        if not all(isinstance(v, (int, float)) for v in values):
+        if not all(isinstance(v, numbers.Number) for v in values):
             errors.append(
                 "BETWEEN operation must only contain numbers, describing the lower and upper bounds of the desired range. Received non-numeric values"
             )
@@ -107,11 +108,15 @@ def apply_between_matcher(df: pd.DataFrame, matcher: RowMatcher, negate: bool = 
             raise HTTPException(status_code=400, detail=combined_error)
         min_val, max_val = sorted(values)
         try:
-            mask = (pd.to_numeric(df[column_name], errors="coerce") >= min_val) & (
-                pd.to_numeric(df[column_name], errors="coerce") < max_val
+            numeric_column = pd.to_numeric(df[column_name], errors="raise")
+            mask = (numeric_column >= min_val) & (numeric_column < max_val)
+        except (ValueError, TypeError) as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Column '{column_name}' contains non-numeric values that cannot be compared with BETWEEN operation. "
+                       f"BETWEEN operation requires numeric data."
             )
-        except:
-            mask = (df[column_name].astype(str) >= str(min_val)) & (df[column_name].astype(str) < str(max_val))
+    
     if negate:
         mask = ~mask
     return df[mask]
