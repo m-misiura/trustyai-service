@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 class RowMatcher(BaseModel):
     """Represents a row matching condition for data filtering."""
+
     columnName: str
     operation: str  # "EQUALS" or "BETWEEN"
     values: List[Any]
@@ -21,6 +22,7 @@ class RowMatcher(BaseModel):
 
 class DataRequestPayload(BaseModel):
     """Request payload for data download operations."""
+
     modelId: str
     matchAny: List[RowMatcher] = Field(default_factory=list)
     matchAll: List[RowMatcher] = Field(default_factory=list)
@@ -29,6 +31,7 @@ class DataRequestPayload(BaseModel):
 
 class DataResponsePayload(BaseModel):
     """Response payload containing filtered data as CSV."""
+
     dataCSV: str
 
 
@@ -40,7 +43,7 @@ def get_storage() -> Any:
 async def load_model_dataframe(model_id: str) -> pd.DataFrame:
     try:
         storage = get_storage_interface()
-        print(f"DEBUG: storage type = {type(storage)}") 
+        print(f"DEBUG: storage type = {type(storage)}")
         input_data, input_cols = await storage.read_data(f"{model_id}_inputs")
         output_data, output_cols = await storage.read_data(f"{model_id}_outputs")
         metadata_data, metadata_cols = await storage.read_data(f"{model_id}_metadata")
@@ -52,15 +55,17 @@ async def load_model_dataframe(model_id: str) -> pd.DataFrame:
             df = pd.concat([df, input_df], axis=1)
         if len(output_data) > 0:
             output_df = pd.DataFrame(output_data, columns=output_cols)
-            df = pd.concat([df, output_df], axis=1) 
+            df = pd.concat([df, output_df], axis=1)
         if len(metadata_data) > 0:
             logger.debug(f"Metadata data type: {type(metadata_data)}")
             logger.debug(f"First row type: {type(metadata_data[0]) if len(metadata_data) > 0 else 'empty'}")
-            logger.debug(f"First row dtype: {metadata_data[0].dtype if hasattr(metadata_data[0], 'dtype') else 'no dtype'}")
+            logger.debug(
+                f"First row dtype: {metadata_data[0].dtype if hasattr(metadata_data[0], 'dtype') else 'no dtype'}"
+            )
             metadata_df = pd.DataFrame(metadata_data, columns=metadata_cols)
             trusty_mapping = {
                 "ID": "trustyai.ID",
-                "MODEL_ID": "trustyai.MODEL_ID", 
+                "MODEL_ID": "trustyai.MODEL_ID",
                 "TIMESTAMP": "trustyai.TIMESTAMP",
                 "TAG": "trustyai.TAG",
                 "INDEX": "trustyai.INDEX",
