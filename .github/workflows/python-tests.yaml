@@ -2,7 +2,7 @@ name: Python Tests
 
 on:
   push:
-    branches: [main, download_and_upload_endpoints]
+    branches: [main]
   pull_request:
     branches: [main]
 
