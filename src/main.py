@@ -19,6 +19,7 @@ from src.endpoints.metrics.drift.approx_ks_test import (
 from src.endpoints.metrics.drift.fourier_mmd import router as drift_fourier_mmd_router
 from src.endpoints.metrics.drift.ks_test import router as drift_ks_test_router
 from src.endpoints.metrics.drift.meanshift import router as drift_meanshift_router
+from src.endpoints.metrics.drift.js import router as drift_jensenshannon_router
 
 # from src.endpoints.explainers import router as explainers_router
 from src.endpoints.explainers.global_explainer import router as explainers_global_router
@@ -99,6 +100,13 @@ app.include_router(
         "Drift Metrics: Meanshift",
     ],
 )
+app.include_router(
+    drift_jensenshannon_router,
+    tags=[
+        "Drift Metrics: Jensen Shannon",
+    ],
+)
+
 # app.include_router(explainers_router, tags=["Explainers: Global", "Explainers: Local"])
 app.include_router(explainers_global_router, tags=["Explainers: Global"])
 app.include_router(explainers_local_router, tags=["Explainers: Local"])
