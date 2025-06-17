@@ -15,7 +15,6 @@ client = TestClient(app)
 
 class DataframeGenerators:
     """Python equivalent of Java DataframeGenerators"""
-
     @staticmethod
     def generate_random_dataframe(observations: int, feature_diversity: int = 100) -> pd.DataFrame:
         random = np.random.RandomState(0)
@@ -28,6 +27,7 @@ class DataframeGenerators:
             "trustyai.MODEL_ID": [],
             "trustyai.TIMESTAMP": [],
             "trustyai.TAG": [],
+            "trustyai.INDEX": [],
         }
         for i in range(observations):
             data["age"].append(i % feature_diversity)
@@ -38,6 +38,7 @@ class DataframeGenerators:
             data["trustyai.MODEL_ID"].append("example1")
             data["trustyai.TIMESTAMP"].append((datetime.now() - timedelta(seconds=i)).isoformat())
             data["trustyai.TAG"].append("")
+            data["trustyai.INDEX"].append(i)
         return pd.DataFrame(data)
 
     @staticmethod
@@ -46,7 +47,6 @@ class DataframeGenerators:
             random = np.random.RandomState(0)
         else:
             random = np.random.RandomState(seed)
-
         makes = ["Ford", "Chevy", "Dodge", "GMC", "Buick"]
         colors = ["Red", "Blue", "White", "Black", "Purple", "Green", "Yellow"]
         data = {
@@ -58,6 +58,7 @@ class DataframeGenerators:
             "trustyai.MODEL_ID": [],
             "trustyai.TIMESTAMP": [],
             "trustyai.TAG": [],
+            "trustyai.INDEX": [],
         }
         for i in range(observations):
             data["year"].append(1970 + i % 50)
@@ -68,7 +69,7 @@ class DataframeGenerators:
             data["trustyai.MODEL_ID"].append("example1")
             data["trustyai.TIMESTAMP"].append((datetime.now() - timedelta(seconds=i)).isoformat())
             data["trustyai.TAG"].append("")
-
+            data["trustyai.INDEX"].append(i)
         return pd.DataFrame(data)
 
 
@@ -76,7 +77,6 @@ class DataframeGenerators:
 class MockStorage:
     def __init__(self):
         self.data = {}
-
     async def read_data(self, dataset_name: str):
         if dataset_name.endswith("_outputs"):
             model_id = dataset_name.replace("_outputs", "")
@@ -90,7 +90,7 @@ class MockStorage:
             if model_id not in self.data:
                 raise Exception(f"Model {model_id} not found")
             metadata_data = self.data[model_id].get("metadata")
-            metadata_cols = ["ID", "MODEL_ID", "TIMESTAMP", "TAG"]
+            metadata_cols = ["ID", "MODEL_ID", "TIMESTAMP", "TAG", "INDEX"] 
             return metadata_data, metadata_cols
         elif dataset_name.endswith("_inputs"):
             model_id = dataset_name.replace("_inputs", "")
@@ -107,22 +107,23 @@ class MockStorage:
         output_cols = [col for col in df.columns if col in ["income", "value"]]
         metadata_cols = [col for col in df.columns if col.startswith("trustyai.")]
         input_data = df[input_cols].values if input_cols else np.array([])
-        output_data = df[output_cols].values if output_cols else np.array([])
-
-        # Use UPPERCASE to match DataframeGenerators
-        metadata_data_cols = ["ID", "MODEL_ID", "TIMESTAMP", "TAG"] 
+        output_data = df[output_cols].values if output_cols else np.array([])       
+        metadata_data_cols = ["ID", "MODEL_ID", "TIMESTAMP", "TAG", "INDEX"] 
         metadata_values = []
         for _, row in df.iterrows():
             row_data = []
             for col in metadata_data_cols:
                 trusty_col = f"trustyai.{col}" 
                 if trusty_col in df.columns:
-                    row_data.append(row[trusty_col])
+                    value = row[trusty_col]
+                    if col == "INDEX":
+                        row_data.append(int(value)) 
+                    else:
+                        row_data.append(str(value)) 
                 else:
-                    row_data.append("")
+                    row_data.append("" if col != "INDEX" else 0)
             metadata_values.append(row_data)
-
-        metadata_data = np.array(metadata_values)
+        metadata_data = np.array(metadata_values, dtype=object) 
         self.data[model_id] = {
             "dataframe": df,
             "input": input_data,
@@ -131,18 +132,14 @@ class MockStorage:
             "output_cols": output_cols,
             "metadata": metadata_data,
         }
-
     def reset(self):
         self.data.clear()
-
-
 mock_storage = MockStorage()
-
 
 @pytest.fixture(autouse=True)
 def setup_storage():
     """Setup mock storage for all tests"""
-    with patch("src.service.utils.download.get_storage", return_value=mock_storage):
+    with patch("src.service.utils.download.get_storage_interface", return_value=mock_storage):
         yield
 
 
@@ -151,11 +148,8 @@ def reset_storage():
     """Reset storage before each test"""
     mock_storage.reset()
     yield
-
-
 # Test constants
 MODEL_ID = "example1"
-
 
 def test_download_data():
     """equivalent of Java downloadData() test"""
@@ -320,6 +314,8 @@ def test_download_text_data_internal_column_index():
         ],
     }
     response = client.post("/data/download", json=payload)
+    print(f"Response status: {response.status_code}")
+    print(f"Response text: {response.text}")
     assert response.status_code == 200
     result = response.json()
     result_df = pd.read_csv(StringIO(result["dataCSV"]))

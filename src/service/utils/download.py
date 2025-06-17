@@ -38,65 +38,42 @@ def get_storage() -> Any:
 
 
 async def load_model_dataframe(model_id: str) -> pd.DataFrame:
-    """
-    Load model dataframe from storage with optimized data reconstruction.
-    """
-    storage = get_storage()
-
     try:
+        storage = get_storage_interface()
+        print(f"DEBUG: storage type = {type(storage)}") 
         input_data, input_cols = await storage.read_data(f"{model_id}_inputs")
         output_data, output_cols = await storage.read_data(f"{model_id}_outputs")
         metadata_data, metadata_cols = await storage.read_data(f"{model_id}_metadata")
         if input_data is None or output_data is None or metadata_data is None:
-            raise HTTPException(status_code=404, detail=f"Model {model_id} not found")
+            raise HTTPException(404, f"Model {model_id} not found")
         df = pd.DataFrame()
         if len(input_data) > 0:
-            if input_data.ndim == 2 and len(input_cols) == 1 and input_data.shape[1] > 1:
-                col_name = input_cols[0]
-                for j in range(input_data.shape[1]):
-                    df[f"{col_name}_{j}"] = input_data[:, j]
-            else:
-                input_df = pd.DataFrame(input_data, columns=input_cols)
-                for col in input_cols:
-                    df[col] = input_df[col]
+            input_df = pd.DataFrame(input_data, columns=input_cols)
+            df = pd.concat([df, input_df], axis=1)
         if len(output_data) > 0:
-            if output_data.ndim == 2 and len(output_cols) == 1 and output_data.shape[1] > 1:
-                col_name = output_cols[0]
-                for j in range(output_data.shape[1]):
-                    df[f"{col_name}_{j}"] = output_data[:, j]
-            else:
-                if output_data.ndim == 2:
-                    output_data = output_data.flatten()
-                output_df = pd.DataFrame({output_cols[0]: output_data})
-                for col in output_cols:
-                    df[col] = output_df[col]
+            output_df = pd.DataFrame(output_data, columns=output_cols)
+            df = pd.concat([df, output_df], axis=1) 
         if len(metadata_data) > 0:
-            if isinstance(metadata_data[0], bytes):
-                # Deserialize pickled metadata
-                deserialized_metadata = [pickle.loads(row) for row in metadata_data]
-                metadata_df = pd.DataFrame(deserialized_metadata, columns=metadata_cols)
-            else:
-                metadata_df = pd.DataFrame(metadata_data, columns=metadata_cols)
+            logger.debug(f"Metadata data type: {type(metadata_data)}")
+            logger.debug(f"First row type: {type(metadata_data[0]) if len(metadata_data) > 0 else 'empty'}")
+            logger.debug(f"First row dtype: {metadata_data[0].dtype if hasattr(metadata_data[0], 'dtype') else 'no dtype'}")
+            metadata_df = pd.DataFrame(metadata_data, columns=metadata_cols)
             trusty_mapping = {
                 "ID": "trustyai.ID",
-                "MODEL_ID": "trustyai.MODEL_ID",
+                "MODEL_ID": "trustyai.MODEL_ID", 
                 "TIMESTAMP": "trustyai.TIMESTAMP",
                 "TAG": "trustyai.TAG",
+                "INDEX": "trustyai.INDEX",
             }
             for orig_col in metadata_cols:
                 trusty_col = trusty_mapping.get(orig_col, orig_col)
                 df[trusty_col] = metadata_df[orig_col]
-        df["trustyai.INDEX"] = range(len(df))
-        logger.info(f"Loaded dataframe for model {model_id}: {df.shape[0]} rows, {df.shape[1]} columns")
         return df
-
     except HTTPException:
         raise
     except Exception as e:
-        if "not found" in str(e).lower() or "MissingH5PYDataException" in str(type(e).__name__):
-            raise HTTPException(status_code=404, detail=f"Model {model_id} not found")
-        logger.error(f"Error loading model {model_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error loading model data: {str(e)}")
+        logger.error(f"Error loading model dataframe: {e}")
+        raise HTTPException(500, f"Error loading model data: {str(e)}")
 
 
 def apply_filters(df: pd.DataFrame, payload: DataRequestPayload) -> pd.DataFrame:
