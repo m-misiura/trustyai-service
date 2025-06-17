@@ -16,6 +16,8 @@ from src.service.constants import (
 from src.service.data.modelmesh_parser import ModelMeshPayloadParser
 from src.service.data.storage import get_storage_interface
 from src.service.utils import list_utils
+from src.endpoints.consumer.consumer_endpoint import KServeData
+
 
 logger = logging.getLogger(__name__)
 
@@ -235,37 +237,41 @@ def process_tensors_using_kserve_logic(
     tensors: List[Dict[str, Any]],
 ) -> Tuple[List[np.ndarray], List[str], List[str], Optional[List[str]]]:
     """
-    Process tensor data using core KServe tensor conversion logic.
+    Process tensor data using KServe data structures and logic from consumer_endpoint.
     """
     if not tensors:
         return [], [], [], None
+
     arrays = []
     all_names = []
     datatypes = []
     execution_ids = None
+
     for tensor in tensors:
         if execution_ids is None:
             execution_ids = tensor.get("execution_ids")
-        name = tensor.get("name", f"tensor_{len(arrays)}")
-        shape = tensor.get("shape", [])
-        datatype = tensor.get("datatype", "INT64")
-        data = tensor.get("data", [])
-        if len(shape) > 1:
-            tensor_names = [f"{name}-{i}" for i in range(shape[1])]
+        kserve_data = KServeData(
+            name=tensor.get("name", f"tensor_{len(arrays)}"),
+            shape=tensor.get("shape", []),
+            datatype=tensor.get("datatype", "INT64"),
+            data=tensor.get("data", []),
+        )
+        if len(kserve_data.shape) > 1:
+            tensor_names = [f"{kserve_data.name}-{i}" for i in range(kserve_data.shape[1])]
         else:
-            tensor_names = [name]
-        if list_utils.contains_non_numeric(data):
-            tensor_array = np.array(data, dtype="O")
+            tensor_names = [kserve_data.name]
+        if list_utils.contains_non_numeric(kserve_data.data):
+            tensor_array = np.array(kserve_data.data, dtype="O")
         else:
             dtype_map = {"INT64": np.int64, "INT32": np.int32, "FP32": np.float32, "FP64": np.float64, "BOOL": np.bool_}
-            np_dtype = dtype_map.get(datatype)
+            np_dtype = dtype_map.get(kserve_data.datatype)
             if np_dtype is not None:
-                tensor_array = np.array(data, dtype=np_dtype)
+                tensor_array = np.array(kserve_data.data, dtype=np_dtype)
             else:
-                tensor_array = np.array(data)
+                tensor_array = np.array(kserve_data.data)
         arrays.append(tensor_array)
         all_names.extend(tensor_names)
-        datatypes.append(datatype)
+        datatypes.append(kserve_data.datatype)
     return arrays, all_names, datatypes, execution_ids
 
 
