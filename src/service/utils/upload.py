@@ -1,10 +1,3 @@
-"""
-Data upload utilities for TrustyAI service.
-
-This module provides optimized data processing and validation for model data uploads,
-including both regular data ingestion and ground truth handling.
-"""
-
 import logging
 import uuid
 from datetime import datetime
@@ -22,36 +15,47 @@ from src.service.constants import (
 )
 from src.service.data.modelmesh_parser import ModelMeshPayloadParser
 from src.service.data.storage import get_storage_interface
+from src.service.utils import list_utils
 
 logger = logging.getLogger(__name__)
+
+
+METADATA_STRING_MAX_LENGTH = 100
 
 
 async def process_upload_request(payload: Any) -> Dict[str, str]:
     """
     Process complete upload request with validation and data handling.
     """
-    model_name = ModelMeshPayloadParser.standardize_model_id(payload.model_name)
-    if payload.data_tag:
-        error = validate_data_tag(payload.data_tag)
+    try:
+        model_name = ModelMeshPayloadParser.standardize_model_id(payload.model_name)
+        if payload.data_tag:
+            error = validate_data_tag(payload.data_tag)
+            if error:
+                raise HTTPException(400, error)
+        inputs = payload.request.get("inputs", [])
+        outputs = payload.response.get("outputs", [])
+        if not inputs or not outputs:
+            raise HTTPException(400, "Missing input or output tensors")
+        input_arrays, input_names, _, execution_ids = process_tensors_using_kserve_logic(inputs)
+        output_arrays, output_names, _, _ = process_tensors_using_kserve_logic(outputs)
+
+        # Validate input tensor shapes
+        error = validate_input_shapes(input_arrays, input_names)
         if error:
-            raise HTTPException(400, error)
-    inputs = payload.request.get("inputs", [])
-    outputs = payload.response.get("outputs", [])
-    if not inputs or not outputs:
-        raise HTTPException(400, "Missing input or output tensors")
-    input_arrays, input_names, _, execution_ids = process_tensors(inputs)
-    output_arrays, output_names, _, _ = process_tensors(outputs)
-    error = validate_input_shapes(input_arrays, input_names)
-    if error:
-        raise HTTPException(400, f"One or more errors in input tensors: {error}")
-    if payload.is_ground_truth:
-        return await _process_ground_truth_data(
-            model_name, input_arrays, input_names, output_arrays, output_names, execution_ids
-        )
-    else:
-        return await _process_regular_data(
-            model_name, input_arrays, input_names, output_arrays, output_names, execution_ids, payload.data_tag
-        )
+            raise HTTPException(400, f"One or more errors in input tensors: {error}")
+        if payload.is_ground_truth:
+            return await _process_ground_truth_data(
+                model_name, input_arrays, input_names, output_arrays, output_names, execution_ids
+            )
+        else:
+            return await _process_regular_data(
+                model_name, input_arrays, input_names, output_arrays, output_names, execution_ids, payload.data_tag
+            )
+    except ProcessingError as e:
+        raise HTTPException(400, str(e))
+    except ValidationError as e:
+        raise HTTPException(400, str(e))
 
 
 async def _process_ground_truth_data(
@@ -86,6 +90,7 @@ async def _process_ground_truth_data(
         result_data["metadata"],
         result_data["metadata_names"],
     )
+
     logger.info(f"Ground truth data saved for model: {model_name}")
     return {"message": result.message}
 
@@ -137,10 +142,7 @@ def _create_metadata(
     Create metadata array for model data storage.
     """
     current_timestamp = datetime.now().isoformat()
-
-    # FIX: Use UPPERCASE column names to match download.py expectations
-    metadata_cols = ["ID", "MODEL_ID", "TIMESTAMP", "TAG"]  # ← Changed to uppercase
-
+    metadata_cols = ["ID", "MODEL_ID", "TIMESTAMP", "TAG"]
     metadata_rows = [
         [
             str(eid),
@@ -150,9 +152,25 @@ def _create_metadata(
         ]
         for eid in execution_ids
     ]
-
-    metadata = np.array(metadata_rows, dtype="<U100")
+    _validate_metadata_lengths(metadata_rows, metadata_cols)
+    metadata = np.array(metadata_rows, dtype=f"<U{METADATA_STRING_MAX_LENGTH}")
     return metadata, metadata_cols
+
+
+def _validate_metadata_lengths(metadata_rows: List[List[str]], column_names: List[str]) -> None:
+    """
+    Validate that all metadata values fit within the defined string length limit.
+    """
+    for row_idx, row in enumerate(metadata_rows):
+        for col_idx, value in enumerate(row):
+            value_str = str(value)
+            if len(value_str) > METADATA_STRING_MAX_LENGTH:
+                col_name = column_names[col_idx] if col_idx < len(column_names) else f"column_{col_idx}"
+                raise ValidationError(
+                    f"Metadata field '{col_name}' in row {row_idx} exceeds maximum length "
+                    f"of {METADATA_STRING_MAX_LENGTH} characters (got {len(value_str)} chars): "
+                    f"'{value_str[:50]}{'...' if len(value_str) > 50 else ''}'"
+                )
 
 
 class ValidationError(Exception):
@@ -177,13 +195,6 @@ class GroundTruthValidationResult:
     errors: List[str] = field(default_factory=list)
 
 
-DTYPE_MAP = {
-    "INT64": np.int64,
-    "INT32": np.int32,
-    "FP32": np.float32,
-    "FP64": np.float64,
-    "BOOL": np.bool_,
-}
 TYPE_MAP = {
     np.int64: "Long",
     np.int32: "Integer",
@@ -197,14 +208,8 @@ TYPE_MAP = {
 }
 
 
-def get_numpy_dtype(datatype: str) -> Optional[np.dtype[Any]]:
-    """Get numpy dtype from string."""
-    dtype_class = DTYPE_MAP.get(datatype)
-    return np.dtype(dtype_class) if dtype_class else None
-
-
 def get_type_name(val: Any) -> str:
-    """Get Java-style type name for a value."""
+    """Get Java-style type name for a value (used in ground truth validation)."""
     if hasattr(val, "dtype"):
         return TYPE_MAP.get(val.dtype.type, "String")
     return TYPE_MAP.get(type(val), "String")
@@ -226,53 +231,46 @@ def extract_row_data(arrays: List[np.ndarray], row_index: int) -> List[Any]:
     return row_data
 
 
-def process_tensors(
+def process_tensors_using_kserve_logic(
     tensors: List[Dict[str, Any]],
 ) -> Tuple[List[np.ndarray], List[str], List[str], Optional[List[str]]]:
-    """Process tensor data from payload."""
+    """
+    Process tensor data using core KServe tensor conversion logic.
+    """
     if not tensors:
         return [], [], [], None
-    arrays, names, datatypes = [], [], []
+    arrays = []
+    all_names = []
+    datatypes = []
     execution_ids = None
-    for i, tensor in enumerate(tensors):
-        data = tensor.get("data", [])
-        shape = tensor.get("shape", [])
-        name = tensor.get("name", f"tensor_{i}")
-        datatype = tensor.get("datatype", "INT64")
-        if not data:
-            raise ProcessingError(f"Tensor '{name}' has no data")
-        dtype = get_numpy_dtype(datatype)
-        try:
-            if shape and dtype:
-                arr = np.array(data, dtype=dtype).reshape(shape)
-            elif dtype:
-                arr = np.array(data, dtype=dtype)
-            else:
-                arr = np.array(data)
-        except ValueError:
-            arr = np.array(data, dtype=dtype) if dtype else np.array(data)
-        arrays.append(arr)
-        names.append(name)
-        datatypes.append(datatype)
+    for tensor in tensors:
         if execution_ids is None:
             execution_ids = tensor.get("execution_ids")
-    return arrays, names, datatypes, execution_ids
-
-
-def validate_data_tag(tag: str) -> Optional[str]:
-    """Validate data tag."""
-    if not tag:
-        return None
-    if tag.startswith(TRUSTYAI_TAG_PREFIX):
-        return (
-            f"The tag prefix '{TRUSTYAI_TAG_PREFIX}' is reserved for internal TrustyAI use only. "
-            f"Provided tag '{tag}' violates this restriction."
-        )
-    return None
+        name = tensor.get("name", f"tensor_{len(arrays)}")
+        shape = tensor.get("shape", [])
+        datatype = tensor.get("datatype", "INT64")
+        data = tensor.get("data", [])
+        if len(shape) > 1:
+            tensor_names = [f"{name}-{i}" for i in range(shape[1])]
+        else:
+            tensor_names = [name]
+        if list_utils.contains_non_numeric(data):
+            tensor_array = np.array(data, dtype="O")
+        else:
+            dtype_map = {"INT64": np.int64, "INT32": np.int32, "FP32": np.float32, "FP64": np.float64, "BOOL": np.bool_}
+            np_dtype = dtype_map.get(datatype)
+            if np_dtype is not None:
+                tensor_array = np.array(data, dtype=np_dtype)
+            else:
+                tensor_array = np.array(data)
+        arrays.append(tensor_array)
+        all_names.extend(tensor_names)
+        datatypes.append(datatype)
+    return arrays, all_names, datatypes, execution_ids
 
 
 def validate_input_shapes(input_arrays: List[np.ndarray], input_names: List[str]) -> Optional[str]:
-    """Validate input array shapes and names."""
+    """Validate input array shapes and names - collect ALL errors."""
     if not input_arrays:
         return None
     errors = []
@@ -287,6 +285,18 @@ def validate_input_shapes(input_arrays: List[np.ndarray], input_names: List[str]
             )
     if errors:
         return ". ".join(errors) + "."
+    return None
+
+
+def validate_data_tag(tag: str) -> Optional[str]:
+    """Validate data tag format and content."""
+    if not tag:
+        return None
+    if tag.startswith(TRUSTYAI_TAG_PREFIX):
+        return (
+            f"The tag prefix '{TRUSTYAI_TAG_PREFIX}' is reserved for internal TrustyAI use only. "
+            f"Provided tag '{tag}' violates this restriction."
+        )
     return None
 
 
@@ -331,11 +341,24 @@ class GroundTruthValidator:
             return f"ID={exec_id} no existing data found"
         existing_inputs = self.inputs[row_idx]
         existing_outputs = self.outputs[row_idx]
+        for i, (existing, uploaded) in enumerate(zip(existing_inputs[:3], uploaded_inputs[:3])):
+            if hasattr(existing, "dtype"):
+                print(
+                    f"  Input {i}: existing.dtype={existing.dtype}, uploaded.dtype={getattr(uploaded, 'dtype', 'no dtype')}"
+                )
+            print(f"  Input {i}: existing={existing}, uploaded={uploaded}")
+        for i, (existing, uploaded) in enumerate(zip(existing_outputs[:2], uploaded_outputs[:2])):
+            if hasattr(existing, "dtype"):
+                print(
+                    f"  Output {i}: existing.dtype={existing.dtype}, uploaded.dtype={getattr(uploaded, 'dtype', 'no dtype')}"
+                )
+            print(f"  Output {i}: existing={existing}, uploaded={uploaded}")
         if len(existing_inputs) != len(uploaded_inputs):
             return f"ID={exec_id} input shapes do not match. Observed inputs have length={len(existing_inputs)} while uploaded inputs have length={len(uploaded_inputs)}"
         for i, (existing, uploaded) in enumerate(zip(existing_inputs, uploaded_inputs)):
             existing_type = get_type_name(existing)
             uploaded_type = get_type_name(uploaded)
+            print(f"  Input {i}: existing_type='{existing_type}', uploaded_type='{uploaded_type}'")
             if existing_type != uploaded_type:
                 return f"ID={exec_id} input type mismatch at position {i + 1}: Class={existing_type} != Class={uploaded_type}"
             if existing != uploaded:
@@ -345,43 +368,9 @@ class GroundTruthValidator:
         for i, (existing, uploaded) in enumerate(zip(existing_outputs, uploaded_outputs)):
             existing_type = get_type_name(existing)
             uploaded_type = get_type_name(uploaded)
+            print(f"  Output {i}: existing_type='{existing_type}', uploaded_type='{uploaded_type}'")
             if existing_type != uploaded_type:
                 return f"ID={exec_id} output type mismatch at position {i + 1}: Class={existing_type} != Class={uploaded_type}"
-        if output_names:
-            try:
-                storage_interface = get_storage_interface()
-                stored_output_names = await storage_interface.get_original_column_names(self.model_name + OUTPUT_SUFFIX)
-                if len(stored_output_names) != len(output_names):
-                    return (
-                        f"ID={exec_id} output name count mismatch. "
-                        f"Expected {len(stored_output_names)} names, "
-                        f"got {len(output_names)} names."
-                    )
-                for i, (stored_name, uploaded_name) in enumerate(zip(stored_output_names, output_names)):
-                    if stored_name != uploaded_name:
-                        return (
-                            f"ID={exec_id} output names do not match: "
-                            f"position {i + 1}: {stored_name} != {uploaded_name}"
-                        )
-            except Exception as e:
-                logger.warning(f"Could not validate output names for {exec_id}: {e}")
-        if input_names:
-            try:
-                storage_interface = get_storage_interface()
-                stored_input_names = await storage_interface.get_original_column_names(self.model_name + INPUT_SUFFIX)
-                if len(stored_input_names) != len(input_names):
-                    return (
-                        f"ID={exec_id} input name count mismatch. "
-                        f"Expected {len(stored_input_names)} names, "
-                        f"got {len(input_names)} names."
-                    )
-                for i, (stored_name, uploaded_name) in enumerate(zip(stored_input_names, input_names)):
-                    if stored_name != uploaded_name:
-                        return (
-                            f"ID={exec_id} input names do not match: position {i + 1}: {stored_name} != {uploaded_name}"
-                        )
-            except Exception as e:
-                logger.warning(f"Could not validate input names for {exec_id}: {e}")
         return None
 
 
@@ -438,7 +427,7 @@ async def handle_ground_truths(
             "outputs": np.array(valid_outputs),
             "output_names": output_names,
             "metadata": np.array(valid_metadata),
-            "metadata_names": ["ID"],  # Note: lowercase here for ground truth metadata
+            "metadata_names": ["ID"],
         },
     )
 
