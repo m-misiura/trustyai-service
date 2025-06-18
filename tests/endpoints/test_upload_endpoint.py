@@ -82,48 +82,82 @@ def generate_payload(n_rows, n_input_cols, n_output_cols, datatype, tag, input_o
 
 
 def generate_multi_input_payload(n_rows, n_input_cols, n_output_cols, datatype, tag):
-    """Generate a test payload with multiple input tensors - one per column."""
+    """Generate a test payload with multi-dimensional tensors like real data."""
     model_name = f"{MODEL_ID}_{uuid.uuid4().hex[:8]}"
-    input_tensors = []
-    for col_idx in range(n_input_cols):
-        tensor_data = []
-        for i in range(n_rows):
-            tensor_data.append(i + col_idx * 10)
-        input_tensors.append({
-            "name": f"input_{col_idx}",
-            "shape": [n_rows],
-            "datatype": datatype,
-            "data": tensor_data,
-        })
-    output_tensors = []
-    for col_idx in range(n_output_cols):
-        tensor_data = []
-        for i in range(n_rows):
-            tensor_data.append(i * 2 + col_idx)
-        output_tensors.append({
-            "name": f"output_{col_idx}",
-            "shape": [n_rows],
-            "datatype": datatype,
-            "data": tensor_data,
-        })
+    input_data = []
+    for row_idx in range(n_rows):
+        row = [row_idx + col_idx * 10 for col_idx in range(n_input_cols)]
+        input_data.append(row)
+    output_data = []
+    for row_idx in range(n_rows):
+        row = [row_idx * 2 + col_idx for col_idx in range(n_output_cols)]
+        output_data.append(row)
     payload = {
         "model_name": model_name,
         "data_tag": tag,
         "is_ground_truth": False,
-        "request": {"inputs": input_tensors},
-        "response": {"outputs": output_tensors},
+        "request": {
+            "inputs": [
+                {
+                    "name": "multi_input",
+                    "shape": [n_rows, n_input_cols],
+                    "datatype": datatype,
+                    "data": input_data,
+                }
+            ]
+        },
+        "response": {
+            "outputs": [
+                {
+                    "name": "multi_output",
+                    "shape": [n_rows, n_output_cols],
+                    "datatype": datatype,
+                    "data": output_data,
+                }
+            ]
+        },
     }
     return payload
 
 
 def generate_mismatched_shape_no_unique_name_multi_input_payload(n_rows, n_input_cols, n_output_cols, datatype, tag):
     """Generate a payload with mismatched shapes and non-unique names."""
-    payload = generate_multi_input_payload(n_rows, n_input_cols, n_output_cols, datatype, tag)
-    payload["request"]["inputs"][0]["name"] = "same_name"
-    payload["request"]["inputs"][1]["name"] = "same_name"
-    if n_rows > 1:
-        payload["request"]["inputs"][1]["shape"][0] = n_rows - 1
-        payload["request"]["inputs"][1]["data"] = payload["request"]["inputs"][1]["data"][:-1]
+    model_name = f"{MODEL_ID}_{uuid.uuid4().hex[:8]}"
+    input_data_1 = [[row_idx + col_idx * 10 for col_idx in range(n_input_cols)] for row_idx in range(n_rows)]
+    mismatched_rows = n_rows - 1 if n_rows > 1 else 1
+    input_data_2 = [[row_idx + col_idx * 20 for col_idx in range(n_input_cols)] for row_idx in range(mismatched_rows)]
+    output_data = [[row_idx * 2 + col_idx for col_idx in range(n_output_cols)] for row_idx in range(n_rows)]
+    payload = {
+        "model_name": model_name,
+        "data_tag": tag,
+        "is_ground_truth": False,
+        "request": {
+            "inputs": [
+                {
+                    "name": "same_name",
+                    "shape": [n_rows, n_input_cols],
+                    "datatype": datatype,
+                    "data": input_data_1,
+                },
+                {
+                    "name": "same_name",
+                    "shape": [mismatched_rows, n_input_cols],
+                    "datatype": datatype,
+                    "data": input_data_2,
+                },
+            ]
+        },
+        "response": {
+            "outputs": [
+                {
+                    "name": "multi_output",
+                    "shape": [n_rows, n_output_cols],
+                    "datatype": datatype,
+                    "data": output_data,
+                }
+            ]
+        },
+    }
     return payload
 
 
@@ -222,21 +256,19 @@ def count_rows_with_tag(model_name, tag):
 def post_test(payload, expected_status_code, check_msgs):
     """Post a payload and check the response."""
     response = client.post("/data/upload", json=payload)
-    
-    # DEBUG: Print the actual error message when test fails
     if response.status_code != expected_status_code:
         print(f"\n=== DEBUG INFO ===")
         print(f"Expected status: {expected_status_code}")
         print(f"Actual status: {response.status_code}")
         print(f"Response text: {response.text}")
         print(f"Response headers: {dict(response.headers)}")
-        if hasattr(response, 'json'):
+        if hasattr(response, "json"):
             try:
                 print(f"Response JSON: {response.json()}")
             except:
                 pass
         print(f"==================")
-    
+
     assert response.status_code == expected_status_code
     return response
 
@@ -261,7 +293,7 @@ def test_upload_data(n_input_rows, n_input_cols, n_output_cols, datatype):
     assert tag_count == n_input_rows, "Not all rows have the correct tag"
 
 
-@pytest.mark.parametrize("n_rows", [1, 3, 5, 6])
+@pytest.mark.parametrize("n_rows", [1, 3, 5, 250])
 @pytest.mark.parametrize("n_input_cols", [2, 6])
 @pytest.mark.parametrize("n_output_cols", [4])
 @pytest.mark.parametrize("datatype", ["INT64", "INT32", "FP32", "FP64", "BOOL"])

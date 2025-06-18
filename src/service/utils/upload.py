@@ -16,7 +16,7 @@ from src.service.constants import (
 from src.service.data.modelmesh_parser import ModelMeshPayloadParser
 from src.service.data.storage import get_storage_interface
 from src.service.utils import list_utils
-from src.endpoints.consumer.consumer_endpoint import KServeData
+from src.endpoints.consumer.consumer_endpoint import KServeData, process_payload
 
 
 logger = logging.getLogger(__name__)
@@ -36,13 +36,17 @@ async def process_upload_request(payload: Any) -> Dict[str, str]:
             if error:
                 raise HTTPException(400, error)
         inputs = payload.request.get("inputs", [])
-        outputs = payload.response.get("outputs", [])
-        if not inputs or not outputs:
-            raise HTTPException(400, "Missing input or output tensors")
-        input_arrays, input_names, _, execution_ids = process_tensors_using_kserve_logic(inputs)
-        output_arrays, output_names, _, _ = process_tensors_using_kserve_logic(outputs)
+        outputs = payload.response.get("outputs", []) if payload.response else []
+        if not inputs:
+            raise HTTPException(400, "Missing input tensors")
+        if payload.is_ground_truth and not outputs:
+            raise HTTPException(400, "Ground truth uploads require output tensors")
 
-        # Validate input tensor shapes
+        input_arrays, input_names, _, execution_ids = process_tensors_using_kserve_logic(inputs)
+        if outputs:
+            output_arrays, output_names, _, _ = process_tensors_using_kserve_logic(outputs)
+        else:
+            output_arrays, output_names = [], []
         error = validate_input_shapes(input_arrays, input_names)
         if error:
             raise HTTPException(400, f"One or more errors in input tensors: {error}")
@@ -92,7 +96,6 @@ async def _process_ground_truth_data(
         result_data["metadata"],
         result_data["metadata_names"],
     )
-
     logger.info(f"Ground truth data saved for model: {model_name}")
     return {"message": result.message}
 
@@ -237,42 +240,87 @@ def process_tensors_using_kserve_logic(
     tensors: List[Dict[str, Any]],
 ) -> Tuple[List[np.ndarray], List[str], List[str], Optional[List[str]]]:
     """
-    Process tensor data using KServe data structures and logic from consumer_endpoint.
+    Process tensor data using the same KServe logic as the consumer endpoint.
     """
     if not tensors:
         return [], [], [], None
+    errors = []
+    tensor_names = [tensor.get("name", f"tensor_{i}") for i, tensor in enumerate(tensors)]
+    if len(tensor_names) != len(set(tensor_names)):
+        errors.append("Input tensors must have unique names")
+    shapes = [tensor.get("shape", []) for tensor in tensors]
+    if len(shapes) > 1:
+        first_dims = [shape[0] if shape else 0 for shape in shapes]
+        if len(set(first_dims)) > 1:
+            errors.append(f"Input tensors must have consistent first dimension. Found: {first_dims}")
+    if errors:
+        error_message = "One or more errors occurred: " + ". ".join(errors)
+        raise HTTPException(400, error_message)
 
-    arrays = []
-    all_names = []
+    class MockKServeData:
+        def __init__(self, name, shape, datatype, data_array):
+            self.name = name
+            self.shape = shape
+            self.datatype = datatype
+            self.data = data_array
+
+    mock_tensors = []
     datatypes = []
     execution_ids = None
-
     for tensor in tensors:
         if execution_ids is None:
             execution_ids = tensor.get("execution_ids")
-        kserve_data = KServeData(
-            name=tensor.get("name", f"tensor_{len(arrays)}"),
-            shape=tensor.get("shape", []),
-            datatype=tensor.get("datatype", "INT64"),
-            data=tensor.get("data", []),
-        )
-        if len(kserve_data.shape) > 1:
-            tensor_names = [f"{kserve_data.name}-{i}" for i in range(kserve_data.shape[1])]
-        else:
-            tensor_names = [kserve_data.name]
-        if list_utils.contains_non_numeric(kserve_data.data):
-            tensor_array = np.array(kserve_data.data, dtype="O")
+        raw_data = tensor.get("data", [])
+        if list_utils.contains_non_numeric(raw_data):
+            np_array = np.array(raw_data, dtype="O")
         else:
             dtype_map = {"INT64": np.int64, "INT32": np.int32, "FP32": np.float32, "FP64": np.float64, "BOOL": np.bool_}
-            np_dtype = dtype_map.get(kserve_data.datatype)
-            if np_dtype is not None:
-                tensor_array = np.array(kserve_data.data, dtype=np_dtype)
-            else:
-                tensor_array = np.array(kserve_data.data)
-        arrays.append(tensor_array)
-        all_names.extend(tensor_names)
-        datatypes.append(kserve_data.datatype)
-    return arrays, all_names, datatypes, execution_ids
+            datatype = tensor.get("datatype", "INT64")
+            np_dtype = dtype_map.get(datatype)
+            np_array = np.array(raw_data, dtype=np_dtype if np_dtype else np.float64)
+        mock_data = MockKServeData(
+            name=tensor.get("name", f"tensor_{len(mock_tensors)}"),
+            shape=tensor.get("shape", []),
+            datatype=tensor.get("datatype", "INT64"),
+            data_array=np_array,
+        )
+        mock_tensors.append(mock_data)
+        datatypes.append(mock_data.datatype)
+
+    class MockPayload:
+        def __init__(self, tensors):
+            self.tensors = tensors
+            self.id = "upload_request"
+
+    mock_payload = MockPayload(mock_tensors)
+    try:
+        tensor_array, column_names = process_payload(mock_payload, lambda p: p.tensors)
+        if len(mock_tensors) == 1:
+            arrays = [tensor_array]
+            all_names = column_names
+        else:
+            arrays = []
+            all_names = []
+            col_start = 0
+            for mock_data in mock_tensors:
+                if len(mock_data.shape) > 1:
+                    n_cols = mock_data.shape[1]
+                    tensor_names = [f"{mock_data.name}-{i}" for i in range(n_cols)]
+                else:
+                    n_cols = 1
+                    tensor_names = [mock_data.name]
+
+                if tensor_array.ndim == 2:
+                    tensor_data = tensor_array[:, col_start : col_start + n_cols]
+                else:
+                    tensor_data = tensor_array[col_start : col_start + n_cols]
+                arrays.append(tensor_data)
+                all_names.extend(tensor_names)
+                col_start += n_cols
+        return arrays, all_names, datatypes, execution_ids
+    except Exception as e:
+        logger.error(f"Failed to process tensors using consumer endpoint logic: {e}")
+        raise HTTPException(400, f"Invalid tensor format: {str(e)}")
 
 
 def validate_input_shapes(input_arrays: List[np.ndarray], input_names: List[str]) -> Optional[str]:

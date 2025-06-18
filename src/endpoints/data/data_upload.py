@@ -21,7 +21,7 @@ class UploadPayload(BaseModel):
     data_tag: Optional[str] = None
     is_ground_truth: bool = False
     request: Dict[str, Any]
-    response: Dict[str, Any]
+    response:  Optional[Dict[str, Any]] = None
 
 
 @router.post("/data/upload")
