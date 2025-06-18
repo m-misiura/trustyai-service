@@ -16,13 +16,53 @@ from src.service.constants import (
 from src.service.data.modelmesh_parser import ModelMeshPayloadParser
 from src.service.data.storage import get_storage_interface
 from src.service.utils import list_utils
-from src.endpoints.consumer.consumer_endpoint import KServeData, process_payload
+from src.endpoints.consumer.consumer_endpoint import process_payload
 
 
 logger = logging.getLogger(__name__)
 
 
 METADATA_STRING_MAX_LENGTH = 100
+
+
+class KServeDataAdapter:
+    """
+    Convert upload tensors to consumer endpoint format.
+    """
+
+    def __init__(self, tensor_dict: Dict[str, Any], numpy_array: np.ndarray):
+        """Initialize adapter with validated data."""
+        self._name = tensor_dict.get("name", "unknown")
+        self._shape = tensor_dict.get("shape", [])
+        self._datatype = tensor_dict.get("datatype", "FP64")
+        self._data = numpy_array  # Keep numpy array intact
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def shape(self) -> List[int]:
+        return self._shape
+
+    @property
+    def datatype(self) -> str:
+        return self._datatype
+
+    @property
+    def data(self) -> np.ndarray:
+        """Returns numpy array with .shape attribute as expected by consumer endpoint."""
+        return self._data
+
+
+class ConsumerEndpointAdapter:
+    """
+    Consumer endpoint's expected structure.
+    """
+
+    def __init__(self, adapted_tensors: List[KServeDataAdapter]):
+        self.tensors = adapted_tensors
+        self.id = f"upload_request_{uuid.uuid4().hex[:8]}"
 
 
 async def process_upload_request(payload: Any) -> Dict[str, str]:
@@ -240,10 +280,36 @@ def process_tensors_using_kserve_logic(
     tensors: List[Dict[str, Any]],
 ) -> Tuple[List[np.ndarray], List[str], List[str], Optional[List[str]]]:
     """
-    Process tensor data using the same KServe logic as the consumer endpoint.
+    Process tensor data using consumer endpoint logic via clean adapter pattern.
     """
     if not tensors:
         return [], [], [], None
+    validation_errors = _validate_tensor_inputs(tensors)
+    if validation_errors:
+        error_message = "One or more errors occurred: " + ". ".join(validation_errors)
+        raise HTTPException(400, error_message)
+    adapted_tensors = []
+    execution_ids = None
+    datatypes = []
+    for tensor in tensors:
+        if execution_ids is None:
+            execution_ids = tensor.get("execution_ids")
+        numpy_array = _convert_tensor_to_numpy(tensor)
+        adapter = KServeDataAdapter(tensor, numpy_array)
+        adapted_tensors.append(adapter)
+        datatypes.append(adapter.datatype)
+    try:
+        adapter_payload = ConsumerEndpointAdapter(adapted_tensors)
+        tensor_array, column_names = process_payload(adapter_payload, lambda payload: payload.tensors)
+        arrays, all_names = _convert_consumer_results_to_upload_format(tensor_array, column_names, adapted_tensors)
+        return arrays, all_names, datatypes, execution_ids
+    except Exception as e:
+        logger.error(f"Consumer endpoint processing failed: {e}")
+        raise HTTPException(400, f"Tensor processing error: {str(e)}")
+
+
+def _validate_tensor_inputs(tensors: List[Dict[str, Any]]) -> List[str]:
+    """Validate tensor inputs and return list of error messages."""
     errors = []
     tensor_names = [tensor.get("name", f"tensor_{i}") for i, tensor in enumerate(tensors)]
     if len(tensor_names) != len(set(tensor_names)):
@@ -253,74 +319,46 @@ def process_tensors_using_kserve_logic(
         first_dims = [shape[0] if shape else 0 for shape in shapes]
         if len(set(first_dims)) > 1:
             errors.append(f"Input tensors must have consistent first dimension. Found: {first_dims}")
-    if errors:
-        error_message = "One or more errors occurred: " + ". ".join(errors)
-        raise HTTPException(400, error_message)
+    return errors
 
-    class MockKServeData:
-        def __init__(self, name, shape, datatype, data_array):
-            self.name = name
-            self.shape = shape
-            self.datatype = datatype
-            self.data = data_array
 
-    mock_tensors = []
-    datatypes = []
-    execution_ids = None
-    for tensor in tensors:
-        if execution_ids is None:
-            execution_ids = tensor.get("execution_ids")
-        raw_data = tensor.get("data", [])
-        if list_utils.contains_non_numeric(raw_data):
-            np_array = np.array(raw_data, dtype="O")
+def _convert_tensor_to_numpy(tensor: Dict[str, Any]) -> np.ndarray:
+    """Convert tensor dictionary to numpy array with proper dtype."""
+    raw_data = tensor.get("data", [])
+
+    if list_utils.contains_non_numeric(raw_data):
+        return np.array(raw_data, dtype="O")
+    dtype_map = {"INT64": np.int64, "INT32": np.int32, "FP32": np.float32, "FP64": np.float64, "BOOL": np.bool_}
+    datatype = tensor.get("datatype", "FP64")
+    np_dtype = dtype_map.get(datatype, np.float64)
+    return np.array(raw_data, dtype=np_dtype)
+
+
+def _convert_consumer_results_to_upload_format(
+    tensor_array: np.ndarray, column_names: List[str], adapted_tensors: List[KServeDataAdapter]
+) -> Tuple[List[np.ndarray], List[str]]:
+    """Convert consumer endpoint results back to upload format."""
+    if len(adapted_tensors) == 1:
+        # Single tensor case
+        return [tensor_array], column_names
+    arrays = []
+    all_names = []
+    col_start = 0
+    for adapter in adapted_tensors:
+        if len(adapter.shape) > 1:
+            n_cols = adapter.shape[1]
+            tensor_names = [f"{adapter.name}-{i}" for i in range(n_cols)]
         else:
-            dtype_map = {"INT64": np.int64, "INT32": np.int32, "FP32": np.float32, "FP64": np.float64, "BOOL": np.bool_}
-            datatype = tensor.get("datatype", "INT64")
-            np_dtype = dtype_map.get(datatype)
-            np_array = np.array(raw_data, dtype=np_dtype if np_dtype else np.float64)
-        mock_data = MockKServeData(
-            name=tensor.get("name", f"tensor_{len(mock_tensors)}"),
-            shape=tensor.get("shape", []),
-            datatype=tensor.get("datatype", "INT64"),
-            data_array=np_array,
-        )
-        mock_tensors.append(mock_data)
-        datatypes.append(mock_data.datatype)
-
-    class MockPayload:
-        def __init__(self, tensors):
-            self.tensors = tensors
-            self.id = "upload_request"
-
-    mock_payload = MockPayload(mock_tensors)
-    try:
-        tensor_array, column_names = process_payload(mock_payload, lambda p: p.tensors)
-        if len(mock_tensors) == 1:
-            arrays = [tensor_array]
-            all_names = column_names
+            n_cols = 1
+            tensor_names = [adapter.name]
+        if tensor_array.ndim == 2:
+            tensor_data = tensor_array[:, col_start : col_start + n_cols]
         else:
-            arrays = []
-            all_names = []
-            col_start = 0
-            for mock_data in mock_tensors:
-                if len(mock_data.shape) > 1:
-                    n_cols = mock_data.shape[1]
-                    tensor_names = [f"{mock_data.name}-{i}" for i in range(n_cols)]
-                else:
-                    n_cols = 1
-                    tensor_names = [mock_data.name]
-
-                if tensor_array.ndim == 2:
-                    tensor_data = tensor_array[:, col_start : col_start + n_cols]
-                else:
-                    tensor_data = tensor_array[col_start : col_start + n_cols]
-                arrays.append(tensor_data)
-                all_names.extend(tensor_names)
-                col_start += n_cols
-        return arrays, all_names, datatypes, execution_ids
-    except Exception as e:
-        logger.error(f"Failed to process tensors using consumer endpoint logic: {e}")
-        raise HTTPException(400, f"Invalid tensor format: {str(e)}")
+            tensor_data = tensor_array[col_start : col_start + n_cols]
+        arrays.append(tensor_data)
+        all_names.extend(tensor_names)
+        col_start += n_cols
+    return arrays, all_names
 
 
 def validate_input_shapes(input_arrays: List[np.ndarray], input_names: List[str]) -> Optional[str]:
